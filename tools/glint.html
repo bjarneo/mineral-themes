@@ -1,0 +1,99 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Glint renderer</title>
+<style>html,body{margin:0;background:#000}canvas{display:block}</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// Glint frames for the animated background. tools/glint.mjs gives the page a
+// mask of the highlights of a specimen with setMask(), then calls
+// renderGlints() once for each frame of the loop. A frame is white, and its
+// alpha holds the glints, so the script colors them for each theme.
+//
+// The loop is seamless: each glint flashes with a period of 12, 6, 4 or 3
+// seconds, so every glint is back at its start when the 12 second loop ends.
+
+function rng(seed) {
+  return () => {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+let SITES = [];
+
+// Finds the brightest local peaks of the mask: the places where light
+// glints on a facet. Peaks keep a minimum distance from each other.
+window.setMask = async (url, seed, count = 40) => {
+  const img = new Image();
+  await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = url; });
+  const w = img.width, h = img.height;
+  const cv = document.createElement('canvas'); cv.width = w; cv.height = h;
+  const cx = cv.getContext('2d'); cx.drawImage(img, 0, 0);
+  const d = cx.getImageData(0, 0, w, h).data;
+  const v = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) v[i] = d[i * 4] / 255;
+  let max = 0;
+  for (let i = 0; i < w * h; i++) max = Math.max(max, v[i]);
+  const peaks = [];
+  const R = 3;
+  for (let y = R; y < h - R; y++) for (let x = R; x < w - R; x++) {
+    const c = v[y * w + x];
+    if (c < max * .18 || c < .04) continue;
+    let top = true;
+    for (let j = -R; j <= R && top; j++) for (let i = -R; i <= R; i++) if (v[(y + j) * w + x + i] > c) { top = false; break; }
+    if (top) peaks.push([x, y, c]);
+  }
+  peaks.sort((a, b) => b[2] - a[2]);
+  const r = rng(seed);
+  SITES = [];
+  for (const [x, y, c] of peaks) {
+    if (SITES.length >= count) break;
+    if (SITES.some(s => Math.hypot(s.x - x, s.y - y) < 16 * w / 960)) continue;
+    SITES.push({
+      x: x / w, y: y / h, s: Math.min(1, c / max) * .6 + .4,
+      period: [12, 6, 4, 3][Math.floor(r() * 4)], phase: r(), turn: (r() - .5) * .3,
+    });
+  }
+  return SITES.length;
+};
+
+// One frame: each glint is a soft core with 4 long rays and 4 short ones.
+window.renderGlints = (frame, frames, seconds, width, height) => {
+  const cv = document.getElementById('c');
+  cv.width = width; cv.height = height;
+  const ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, width, height);
+  const t = frame / frames * seconds;
+  const k = width / 960;
+  for (const g of SITES) {
+    const wave = Math.sin(2 * Math.PI * (t / g.period + g.phase));
+    const a = Math.pow(Math.max(0, wave), 6) * g.s;
+    if (a < .01) continue;
+    const x = g.x * width, y = g.y * height, len = (14 + 26 * a) * k * g.s;
+    ctx.save();
+    ctx.translate(x, y); ctx.rotate(g.turn);
+    const core = ctx.createRadialGradient(0, 0, 0, 0, 0, 7 * k);
+    core.addColorStop(0, `rgba(255,255,255,${a})`); core.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = core; ctx.beginPath(); ctx.arc(0, 0, 7 * k, 0, Math.PI * 2); ctx.fill();
+    for (let i = 0; i < 8; i++) {
+      const long = i % 2 === 0, L = long ? len : len * .45;
+      ctx.save(); ctx.rotate(i * Math.PI / 4);
+      const ray = ctx.createLinearGradient(0, 0, L, 0);
+      ray.addColorStop(0, `rgba(255,255,255,${a * (long ? .9 : .6)})`); ray.addColorStop(1, 'rgba(255,255,255,0)');
+      ctx.fillStyle = ray;
+      ctx.beginPath(); ctx.moveTo(0, -1.1 * k); ctx.lineTo(L, 0); ctx.lineTo(0, 1.1 * k); ctx.closePath(); ctx.fill();
+      ctx.restore();
+    }
+    ctx.restore();
+  }
+  return cv.toDataURL('image/png');
+};
+</script>
+</body>
+</html>

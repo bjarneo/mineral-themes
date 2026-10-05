@@ -1,0 +1,1804 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Mineral photo renderer</title>
+<style>html,body{margin:0;background:#000}</style>
+</head>
+<body>
+<script src="crystals.js"></script>
+<script>
+// Photographic backgrounds of minerals. The page ray-marches 3D scenes on the
+// GPU with WebGL2: soft shadows, ambient occlusion, glossy reflections,
+// refraction through clear crystals and depth of field, then a filmic tone
+// curve and grain. tools/photo.mjs calls setup() once and renderPhoto() for
+// each image. Chromium needs --use-angle=vulkan to use the GPU. Without it,
+// SwiftShader renders on the CPU and is very slow.
+//
+// Each image adds up many samples. Every sample moves the pixel a little for
+// anti-aliasing and moves the camera inside the lens for depth of field. A
+// clear mineral with dispersion traces red, green and blue in turn, so the
+// samples add up to colored flashes. The frame renders in tiles, so no single
+// draw call runs long on the GPU.
+//
+// Scenes:
+//   specimen  a specimen in its typical habit on a seamless backdrop
+//   wordmark  the Omarchy wordmark spelled in small pieces of the mineral
+//   slab      a close-up of a polished slab with the pattern of the mineral
+//   gem       a cut gem on a table
+//   rough     rough pieces or crystals from a low angle
+//   glint     the light glints of the specimen scene, as a mask for the video
+
+const canvas = document.createElement('canvas');
+const gl = canvas.getContext('webgl2', { antialias: false, preserveDrawingBuffer: false });
+let contextLosses = 0;
+canvas.addEventListener('webglcontextlost', e => { contextLosses++; e.preventDefault(); });
+window.diagnostics = () => ({ contextLosses, lost: gl.isContextLost(), error: gl.getError() });
+gl.getExtension('EXT_color_buffer_float');
+const floatLinear = !!gl.getExtension('OES_texture_float_linear');
+let logoTexture = null, logoInfo = null;
+const programs = {};
+
+// ---------- colors ----------
+
+function rgb(hex) { return [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16)); }
+function lin(hex) { return rgb(hex).map(v => { v /= 255; return v <= .04045 ? v / 12.92 : ((v + .055) / 1.055) ** 2.4; }); }
+function mix(a, b, t) { const pa = rgb(a), pb = rgb(b); return '#' + pa.map((v, i) => Math.round(v * (1 - t) + pb[i] * t).toString(16).padStart(2, '0')).join(''); }
+
+function rng(seed) {
+  return () => {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+// ---------- the wordmark as a distance field ----------
+
+// The letters become a signed distance field in logo units (the SVG is
+// 1215 x 285). The wordmark scene places the pieces inside the letters.
+window.setup = paths => {
+  const SCALE = 3, PAD = 64, w = 1215 * SCALE + PAD * 2, h = 285 * SCALE + PAD * 2;
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const cx = c.getContext('2d');
+  cx.fillStyle = '#000'; cx.fillRect(0, 0, w, h);
+  cx.translate(PAD, PAD); cx.scale(SCALE, SCALE); cx.fillStyle = '#fff';
+  paths.forEach(p => cx.fill(new Path2D(p.d), p.evenodd ? 'evenodd' : 'nonzero'));
+  const img = cx.getImageData(0, 0, w, h).data;
+  const inside = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) inside[i] = img[i * 4] > 127 ? 1 : 0;
+  const dOut = edt(inside, w, h, 0), dIn = edt(inside, w, h, 1);
+  const field = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) field[i] = (Math.sqrt(dOut[i]) - Math.sqrt(dIn[i])) / SCALE;
+  logoTexture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, logoTexture);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, w, h, 0, gl.RED, gl.FLOAT, field);
+  const filter = floatLinear ? gl.LINEAR : gl.NEAREST;
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  logoInfo = { w, h, scale: SCALE, pad: PAD };
+  return true;
+};
+
+// Squared Euclidean distance to the nearest pixel whose value differs from
+// `of`, by the Felzenszwalb and Huttenlocher method.
+function edt(mask, w, h, of) {
+  const INF = 1e20, d = new Float64Array(w * h);
+  for (let i = 0; i < w * h; i++) d[i] = mask[i] === of ? INF : 0;
+  const n = Math.max(w, h), f = new Float64Array(n), out = new Float64Array(n), v = new Int32Array(n), z = new Float64Array(n + 1);
+  const pass = (len, get, set) => {
+    for (let q = 0; q < len; q++) f[q] = get(q);
+    let k = 0; v[0] = 0; z[0] = -INF; z[1] = INF;
+    for (let q = 1; q < len; q++) {
+      let s;
+      do { const p = v[k]; s = ((f[q] + q * q) - (f[p] + p * p)) / (2 * q - 2 * p); if (s <= z[k]) k--; else break; } while (k >= 0);
+      k++; v[k] = q; z[k] = s; z[k + 1] = INF;
+    }
+    k = 0;
+    for (let q = 0; q < len; q++) { while (z[k + 1] < q) k++; const p = v[k]; out[q] = (q - p) * (q - p) + f[p]; }
+    for (let q = 0; q < len; q++) set(q, out[q]);
+  };
+  for (let x = 0; x < w; x++) pass(h, y => d[y * w + x], (y, val) => { d[y * w + x] = val; });
+  for (let y = 0; y < h; y++) pass(w, x => d[y * w + x], (x, val) => { d[y * w + x] = val; });
+  return d;
+}
+
+// ---------- shaders ----------
+
+const VERT = `#version 300 es
+void main() { vec2 p = vec2(gl_VertexID & 1, gl_VertexID >> 1) * 4.0 - 1.0; gl_Position = vec4(p, 0.0, 1.0); }`;
+
+const COMMON = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+out vec4 outColor;
+uniform vec2 uRes;
+uniform vec2 uJitter;
+uniform vec2 uLens;
+uniform float uSeed;
+uniform vec3 uCamPos, uCamTarget;
+uniform float uFocal, uAperture, uFocus;
+uniform vec3 uKeyDir, uKeyCol, uFillCol, uRimDir, uRimCol;
+uniform float uDay, uSoft, uIndex, uTable, uMask;
+uniform vec3 cBg, cDark, cAccent, cSecond, cTableA, cTableB, cFloor;
+uniform vec3 cCol, cCol2, cMtx;
+uniform vec3 cBokeh[6];
+uniform sampler2D uLogo;
+uniform vec4 uLogoInfo;
+// The mineral: habit planes, instances, material and pattern
+uniform vec4 uPl[96];
+uniform int uPlN;
+uniform vec4 uI[24];
+uniform vec4 uQ[24];
+uniform vec4 uA[24];
+uniform int uIN;
+uniform int uHabit, uMat, uPat, uPiece;
+uniform float uIor, uDisp, uChan, uRough, uF0, uRound, uSigmaK;
+uniform vec4 uRock;
+uniform vec3 uRockS;
+uniform vec4 uCut;
+uniform vec4 uRest;
+uniform vec3 uPA;
+uniform float uRestH, uPieceK, uLogoK;
+uniform vec2 uCove;
+uniform float uZone, uIrid, uDbg, uStria, uBand, uTopY, uBounces, uPieceR;
+// Loops start at a uniform zero, so the driver does not unroll them. An
+// unrolled march inlines the whole scene many times, and the compile then
+// takes longer than the GPU watchdog of Chromium allows.
+uniform int uZero;
+#define ZERO min(uZero, 0)
+bool gAO = false;
+// The hardness of the shadow at the current point: lower is softer.
+float gShadowK = 8.0, gShadowMix = 0.0;
+
+const float PI = 3.14159265;
+
+float hash12(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * .1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
+vec2 hash22(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * vec3(.1031, .1030, .0973)); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.xx + p3.yz) * p3.zy); }
+float hash13(vec3 p3) { p3 = fract(p3 * .1031); p3 += dot(p3, p3.zyx + 31.32); return fract((p3.x + p3.y) * p3.z); }
+vec3 hash33(vec3 p3) { p3 = fract(p3 * vec3(.1031, .1030, .0973)); p3 += dot(p3, p3.yxz + 33.33); return fract((p3.xxy + p3.yxx) * p3.zyx); }
+float noise2(vec2 p) { vec2 i = floor(p), f = fract(p); vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash12(i), hash12(i + vec2(1, 0)), u.x), mix(hash12(i + vec2(0, 1)), hash12(i + vec2(1, 1)), u.x), u.y); }
+float noise3(vec3 p) { vec3 i = floor(p), f = fract(p); vec3 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(mix(hash13(i), hash13(i + vec3(1, 0, 0)), u.x), mix(hash13(i + vec3(0, 1, 0)), hash13(i + vec3(1, 1, 0)), u.x), u.y),
+             mix(mix(hash13(i + vec3(0, 0, 1)), hash13(i + vec3(1, 0, 1)), u.x), mix(hash13(i + vec3(0, 1, 1)), hash13(i + vec3(1, 1, 1)), u.x), u.y), u.z); }
+float fbm2(vec2 p) { float s = 0.0, a = .5; for (int i = ZERO; i < 6; i++) { s += a * noise2(p); p = p * 2.03 + vec2(1.7, 9.2); a *= .5; } return s; }
+float fbm3(vec3 p) { float s = 0.0, a = .5; for (int i = ZERO; i < 4; i++) { s += a * noise3(p); p = p * 2.07 + vec3(1.7, 9.2, 3.1); a *= .5; } return s; }
+float fbm3l(vec3 p) { float s = 0.0, a = .5; for (int i = ZERO; i < 2; i++) { s += a * noise3(p); p = p * 2.07 + vec3(1.7, 9.2, 3.1); a *= .5; } return s * 1.33; }
+
+float smin(float a, float b, float k) { float h = max(k - abs(a - b), 0.0) / k; return min(a, b) - h * h * k * .25; }
+float smax(float a, float b, float k) { return -smin(-a, -b, k); }
+mat2 rot(float a) { float c = cos(a), s = sin(a); return mat2(c, -s, s, c); }
+float sdEllipsoid(vec3 p, vec3 r) { float k0 = length(p / r); float k1 = length(p / (r * r)); return k0 * (k0 - 1.0) / k1; }
+float sdBox(vec3 p, vec3 b) { vec3 q = abs(p) - b; return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0); }
+vec3 qrot(vec4 q, vec3 v) { return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v); }
+vec3 qinv(vec4 q, vec3 v) { return qrot(vec4(-q.xyz, q.w), v); }
+// The rotation that turns the y axis into the unit vector a.
+vec4 qFromY(vec3 a) { vec3 c = vec3(a.z, 0.0, -a.x); float w = 1.0 + a.y; if (w < 1e-4) return vec4(1.0, 0.0, 0.0, 0.0); return normalize(vec4(c, w)); }
+vec4 qmul(vec4 a, vec4 b) { return vec4(a.w * b.xyz + b.w * a.xyz + cross(a.xyz, b.xyz), a.w * b.w - dot(a.xyz, b.xyz)); }
+vec4 qAxis(vec3 ax, float a) { return vec4(ax * sin(a * .5), cos(a * .5)); }
+
+// Cellular noise: x is the distance to the nearest cell point, y to the
+// second nearest, z is the id of the nearest cell.
+vec3 voronoi3(vec3 p) {
+  vec3 i = floor(p), f = fract(p); float d1 = 8.0, d2 = 8.0, id = 0.0;
+  for (int z = ZERO - 1; z <= 1; z++) for (int y = ZERO - 1; y <= 1; y++) for (int x = ZERO - 1; x <= 1; x++) {
+    vec3 g = vec3(x, y, z), o = hash33(i + g);
+    float d = length(g + o - f);
+    if (d < d1) { d2 = d1; d1 = d; id = hash13(i + g); } else if (d < d2) d2 = d;
+  }
+  return vec3(d1, d2, id);
+}
+vec3 voronoi2(vec2 p) {
+  vec2 i = floor(p), f = fract(p); float d1 = 8.0, d2 = 8.0, id = 0.0;
+  for (int y = ZERO - 1; y <= 1; y++) for (int x = ZERO - 1; x <= 1; x++) {
+    vec2 g = vec2(x, y), o = hash22(i + g);
+    float d = length(g + o - f);
+    if (d < d1) { d2 = d1; d1 = d; id = hash12(i + g); } else if (d < d2) d2 = d;
+  }
+  return vec3(d1, d2, id);
+}
+vec3 spectral(float t) { return clamp(.5 + .5 * cos(6.2831 * (t + vec3(0.0, .33, .67))), 0.0, 1.0); }
+// Thin film interference: the color of a thin oxide layer of thickness d in
+// nanometers, seen at the cosine c.
+vec3 thinFilm(float d, float c) {
+  vec3 lam = vec3(650.0, 532.0, 450.0);
+  vec3 ph = 4.0 * PI * 1.8 * d * sqrt(max(1.0 - (1.0 - c * c) / 3.24, 0.0)) / lam;
+  return .5 + .5 * cos(ph);
+}
+
+vec3 env(vec3 d);
+
+// Soft disc lights far behind the subject, already out of focus.
+vec3 bokeh(vec3 d) {
+  vec3 col = vec3(0.0);
+  float az = atan(d.x, -d.z), el = asin(clamp(d.y, -1.0, 1.0));
+  vec2 g = vec2(az, el) * vec2(11.0, 14.0);
+  for (int j = ZERO - 1; j <= 1; j++) for (int i = ZERO - 1; i <= 1; i++) {
+    vec2 c = floor(g) + vec2(i, j);
+    float h = hash12(c + uIndex * 3.1);
+    if (h < .62) continue;
+    vec2 o = hash22(c + 7.7) * .8 + .1;
+    float r = .22 + hash12(c + 3.3) * .32;
+    float dist = length(g - c - o);
+    float disc = smoothstep(r, r * .82, dist) * (.75 + .25 * smoothstep(r * .5, r, dist));
+    vec3 tint = cBokeh[int(hash12(c + 1.9) * 5.99)];
+    col += disc * tint * (.5 + 1.3 * hash12(c + 5.5));
+  }
+  return col * smoothstep(-.05, .2, d.y);
+}
+
+// The room around the scene. At night a warm lamp and soft lights far away,
+// in the day a bright window. Clear crystals and gems show it in their facets,
+// so it has a few bright panels besides the main light.
+vec3 env(vec3 d) {
+  vec3 key = normalize(uKeyDir), rim = normalize(uRimDir);
+  if (uDay > .5) {
+    vec3 col = mix(vec3(.62, .60, .58), vec3(1.0, .99, .97), smoothstep(-.4, .7, d.y)) * 1.15;
+    col = mix(col, col * cBg * 1.25, .35);
+    float win = smoothstep(.72, .93, dot(d, key));
+    float panel = smoothstep(.86, .96, dot(d, rim)) * 1.4;
+    return col + (win * 3.4 + panel) * vec3(1.0, .99, .96);
+  }
+  vec3 col = cDark * .25 * (.55 + .45 * d.y) + .012;
+  col += smoothstep(.80, .97, dot(d, key)) * uKeyCol * 2.6;
+  col += smoothstep(.9, .985, dot(d, rim)) * uRimCol * 2.2;
+  // A studio: a broad softbox above, a strip at the left and a colored strip
+  // at the right. Facets, metals and clear crystals show them.
+  col += smoothstep(.35, .8, d.y) * vec3(.62, .58, .54) * (.75 + .25 * smoothstep(.8, .95, d.y));
+  col += smoothstep(.78, .9, dot(d, normalize(vec3(-.9, .35, .55)))) * vec3(.85, .8, .74) * .9;
+  col += smoothstep(.84, .93, dot(d, normalize(vec3(.95, .3, .2)))) * mix(vec3(.6), cAccent, .5) * .8;
+  col += smoothstep(.2, .85, d.z) * smoothstep(-.3, .3, d.y) * vec3(.3, .29, .28);
+  col += bokeh(d) * .45;
+  return col;
+}
+
+float ggx(vec3 n, vec3 h, float r) { float a = r * r, a2 = a * a; float nh = max(dot(n, h), 0.0); float d = nh * nh * (a2 - 1.0) + 1.0; return a2 / (PI * d * d); }
+float schlick(float c, float f0) { return f0 + (1.0 - f0) * pow(1.0 - c, 5.0); }
+
+// ---------- shapes of the mineral ----------
+
+// A convex crystal from its face planes. The planes already carry the stretch
+// of the crystal and unit normals, so each plane gives its true distance and
+// long needles march fast.
+float poly(vec3 q) {
+  float d = -1e9;
+  for (int k = ZERO; k < 96; k++) { if (k >= uPlN) break; d = max(d, dot(q, uPl[k].xyz) - uPl[k].w); }
+  return d;
+}
+
+// Bismuth: square frames that step up and out around a hollow middle.
+float hopperD(vec3 q) {
+  float d = sdBox(q - vec3(0.0, -.02, 0.0), vec3(.22, .06, .22));
+  for (int k = ZERO; k < 6; k++) {
+    float s = .3 + .13 * float(k);
+    vec3 c = q - vec3(0.0, .1 * float(k), 0.0);
+    float outer = sdBox(c, vec3(s, .05, s));
+    float inner = sdBox(c, vec3(s - .15, .2, s - .15));
+    d = min(d, max(outer, -inner));
+  }
+  return d;
+}
+
+// Cavansite: a ball of fine radiating needles.
+float spikyD(vec3 q, float r) {
+  vec3 n = normalize(q);
+  float spikes = pow(noise3(n * 18.0), 3.0) * .22 + noise3(n * 40.0) * .05;
+  return (length(q) - r * (.82 + spikes)) * .6;
+}
+
+// One instance of the specimen: a crystal, a needle, a ball or a hopper.
+float instD(vec3 p, int i) {
+  vec4 I = uI[i], A = uA[i];
+  vec3 q = qinv(uQ[i], p - I.xyz) / I.w;
+  float d;
+  if (A.w < .5) d = poly(q) - uRound;
+  else if (A.w < 1.5) { vec3 c = q; c.y -= clamp(c.y, 0.0, A.y); d = length(c) - A.x * (1.0 - .5 * clamp(q.y / A.y, 0.0, 1.0)); }
+  else if (A.w < 2.5) d = length(q) - A.x;
+  else if (A.w < 3.5) d = hopperD(q);
+  else d = spikyD(q, A.x);
+  return d * I.w;
+}
+// A sphere around the instance: A.x is the radius of a crystal, a ball or a
+// needle, and A.y the length of a needle.
+float instBound(vec3 p, int i) {
+  vec4 I = uI[i], A = uA[i];
+  float r = A.w < .5 ? A.x : A.w < 1.5 ? A.x + A.y : A.w < 2.5 ? A.x : A.w < 3.5 ? 1.5 : A.x * 1.3;
+  return length(p - I.xyz) - I.w * r - .05;
+}
+
+// The host rock under the crystals: a lumpy, flattened stone.
+float rockD(vec3 p) {
+  vec3 q = (p - uRock.xyz);
+  float d = sdEllipsoid(q, uRockS);
+  // Broken faces, so the rock looks split from a larger stone
+  float ms = min(uRockS.x, min(uRockS.y, uRockS.z));
+  for (int k = ZERO; k < 5; k++) {
+    vec3 nn = normalize(hash33(vec3(uIndex, float(k), 3.0)) - .5 + vec3(0.0, .25, 0.0));
+    d = max(d, (dot(q / uRockS, nn) - (.5 + .22 * hash13(vec3(float(k), uIndex, 1.0)))) * ms);
+  }
+  d += (fbm3(q * .9 + uIndex) - .5) * .3 * ms + (fbm3l(q * 4.0) - .5) * .06;
+  return max(d, -p.y);
+}
+`;
+
+// The surfaces under the scenes. kind: 0 walnut, 1 slate, 2 marble, 3 linen,
+// 4 oak, 5 dark velvet, 6 matte paper, 7 glossy black.
+const TABLE = `
+vec3 tableColor(vec3 p, out float rough, out vec3 bump) {
+  rough = .55; bump = vec3(0.0);
+  int kind = int(uTable + .5);
+  if (kind == 0 || kind == 4) {
+    float plank = floor(p.z / 6.0);
+    vec2 q = vec2(p.x * .035 + plank * 3.7, p.z * .9 + plank * 1.3);
+    float grain = fbm2(vec2(q.x * 4.0, q.y * .25));
+    float rings = sin((grain * 9.0 + p.z * .55 + plank) * 2.2) * .5 + .5;
+    float fine = noise2(vec2(p.x * 3.0, p.z * 40.0));
+    float t = clamp(rings * .55 + fine * .25 + grain * .35, 0.0, 1.0);
+    float seam = smoothstep(.04, 0.0, abs(fract(p.z / 6.0) - .0)) + smoothstep(.04, 0.0, abs(fract(p.z / 6.0) - 1.0));
+    rough = mix(.38, .62, fine);
+    bump = vec3(0.0, 0.0, (fine - .5) * .05);
+    return mix(cTableA, cTableB, t) * (1.0 - seam * .6);
+  }
+  if (kind == 1) {
+    float n = fbm2(p.xz * .35);
+    rough = .7;
+    bump = vec3((noise2(p.xz * 6.0) - .5) * .06, 0.0, (noise2(p.xz * 6.0 + 9.0) - .5) * .06);
+    return mix(cTableA, cTableB, n);
+  }
+  if (kind == 2) {
+    vec2 q = p.xz * .09;
+    vec2 w = vec2(fbm2(q * 1.3), fbm2(q * 1.3 + 7.1)) * 2.2;
+    float v = abs(fbm2(q * 1.7 + w) - .5);
+    float vein = exp(-v * 40.0) * .65 + exp(-v * 11.0) * .2;
+    rough = .22;
+    return mix(cTableA, cTableB, vein);
+  }
+  if (kind == 5) {
+    rough = .85;
+    return mix(cTableA, cTableB, fbm2(p.xz * .12) * .6);
+  }
+  if (kind == 6) {
+    rough = .8;
+    return mix(cTableA, cTableB, fbm2(p.xz * .2) * .4);
+  }
+  if (kind == 7) {
+    rough = .08;
+    return mix(cTableA, cTableB, fbm2(p.xz * .15) * .3);
+  }
+  float weave = (sin(p.x * 26.0) * .5 + .5) * (sin(p.z * 26.0) * .5 + .5);
+  float slub = noise2(vec2(p.x * 2.0, p.z * 30.0)) * .5 + noise2(vec2(p.x * 30.0, p.z * 2.0)) * .5;
+  rough = .9;
+  bump = vec3((weave - .5) * .05, 0.0, (slub - .5) * .05);
+  return mix(cTableA, cTableB, clamp(weave * .35 + slub * .5, 0.0, 1.0));
+}
+`;
+
+// The march, the normal, shadows and ambient occlusion, shared by the scenes.
+// Each scene defines vec2 map(vec3 p).
+const MARCH = `
+vec2 march(vec3 ro, vec3 rd, float tmax) {
+  float t = .02, id = -1.0;
+  for (int i = ZERO; i < 200; i++) {
+    vec2 h = map(ro + rd * t);
+    if (h.x < .0006 * t) { id = h.y; break; }
+    t += h.x * .9;
+    if (t > tmax) break;
+  }
+  return vec2(t, id);
+}
+vec3 calcNormal(vec3 p, float t) {
+  float e = .0005 * max(t, 1.0);
+  vec2 k = vec2(1, -1);
+  return normalize(k.xyy * map(p + k.xyy * e).x + k.yyx * map(p + k.yyx * e).x + k.yxy * map(p + k.yxy * e).x + k.xxx * map(p + k.xxx * e).x);
+}
+float softShadow(vec3 ro, vec3 rd, float k) {
+  float res = 1.0, t = .02, ph = 1e10;
+  for (int i = ZERO; i < 90; i++) {
+    float h = map(ro + rd * t).x;
+    if (h < .0005) return 0.0;
+    float y = h * h / (2.0 * ph), d = sqrt(max(h * h - y * y, 0.0));
+    res = min(res, k * d / max(0.0, t - y));
+    if (res < .02) return 0.0;
+    ph = h; t += clamp(h, .02, .28);
+    if (t > 22.0 || (rd.y > 0.0 && ro.y + rd.y * t > uTopY)) break;
+  }
+  return clamp(res, 0.0, 1.0);
+}
+float ambientOcclusion(vec3 p, vec3 n) {
+  float occ = 0.0, sca = 1.0;
+  gAO = true;
+  for (int i = ZERO; i < 5; i++) { float h = .02 + .11 * float(i); occ += (h - map(p + h * n).x) * sca; sca *= .8; }
+  gAO = false;
+  return clamp(1.0 - 2.2 * occ, 0.0, 1.0);
+}
+// Daylight comes through a window, so the frame casts soft bars of shadow.
+float windowPanes(vec3 p, vec3 key) {
+  vec3 t1 = normalize(cross(key, vec3(0.0, 0.0, 1.0))), t2 = cross(key, t1);
+  vec2 lc = vec2(dot(p, t1), dot(p, t2)) / 9.0 - vec2(.15, .1);
+  vec2 a = abs(lc);
+  float inside = (1.0 - smoothstep(.95, 1.15, a.x)) * (1.0 - smoothstep(1.2, 1.45, a.y));
+  float bars = max(1.0 - smoothstep(.02, .07, a.x), 1.0 - smoothstep(.02, .07, a.y));
+  return mix(.62, 1.0, inside * (1.0 - bars * .8));
+}
+float gSpec;
+// Light on a surface: a soft key light, a rim light, the room and reflections.
+// gSpec collects the highlights for the glint mask.
+vec3 light(vec3 p, vec3 n, vec3 rd, vec3 albedo, float rough, float f0, float metal, float sss) {
+  vec3 key = normalize(uKeyDir), rim = normalize(uRimDir), v = -rd;
+  float sh = uDbg == 1.0 ? 1.0 : mix(softShadow(p + n * .004, key, gShadowK), 1.0, gShadowMix);
+  if (uDay > .5) sh *= windowPanes(p, key);
+  float ao = uDbg == 2.0 ? 1.0 : ambientOcclusion(p, n);
+  float nl = dot(n, key);
+  float diff = max(nl, 0.0) * sh;
+  float wrap = max((nl + sss) / (1.0 + sss), 0.0) * mix(1.0, sh, .7);
+  vec3 h = normalize(key + v);
+  float nv = max(dot(n, v), 1e-3);
+  float fr = schlick(nv, f0);
+  float spec = ggx(n, h, rough) * schlick(max(dot(h, v), 0.0), f0) * diff;
+  vec3 specCol = mix(vec3(1.0), albedo, metal);
+  float rimL = pow(max(dot(n, rim), 0.0), 2.0) * pow(1.0 - nv, 1.5);
+  float rimSpec = ggx(n, normalize(rim + v), rough) * schlick(max(dot(normalize(rim + v), v), 0.0), f0) * max(dot(n, rim), 0.0);
+  vec3 col = albedo * (1.0 - metal) * (uKeyCol * mix(diff, wrap, sss > 0.0 ? 1.0 : 0.0) + uFillCol * ao * (.6 + .4 * n.y));
+  col += specCol * uKeyCol * spec;
+  col += specCol * uRimCol * rimSpec * .6;
+  col += uRimCol * rimL * ao * (.6 + .4 * (1.0 - rough));
+  vec3 refl = env(reflect(rd, n));
+  col += refl * specCol * fr * ao * (1.0 - rough * .85) * mix(.6, 1.0, metal);
+  gSpec += (spec + rimSpec * .5) * (1.0 - rough);
+  return col;
+}
+`;
+
+// The parts of the mineral that every scene shares: the patterns of the
+// surface, the material, and the path of light through a clear crystal.
+const MINERAL = `
+// Local coordinates of the last hit, set by the scene.
+vec3 gLocal;
+float gCutFace;
+vec3 gStriaAxis;
+
+// The color of the surface at a local point q. rough, add and metal can
+// change: add is light that the pattern itself sends, such as the flash of
+// labradorite or the play of color of opal.
+vec3 pattern(vec3 q, vec3 n, vec3 v, inout float rough, inout vec3 add, inout float metal) {
+  vec3 key = normalize(uKeyDir);
+  vec3 h = normalize(key + v);
+  vec3 col = cCol;
+  float m = fbm3(q * 2.2 + uIndex);
+  if (uPat == 1) {
+    // Bands around the centers where the mineral began to grow: malachite,
+    // agate, rhodochrosite. Each center gives its own set of rings.
+    vec3 w = q + (vec3(fbm3(q * 1.3), fbm3(q * 1.3 + 4.0), fbm3(q * 1.3 + 8.0)) - .5) * .35;
+    vec3 vo = voronoi3(w * uBand + 2.0);
+    float r = vo.x * 1.4 / uBand + vo.z * 3.0;
+    float fine = sin(r * 34.0 + fbm3(q * 6.0) * 2.5) * .5 + .5;
+    float broad = sin(r * 11.0 + 1.3) * .5 + .5;
+    float b = smoothstep(.3, .7, fine) * .55 + smoothstep(.25, .75, broad) * .45;
+    col = mix(cCol2, cCol, b);
+    // Agate has gray, see-through bands between the colored ones.
+    if (uBand < .5) col = mix(col, vec3(.55, .56, .6) * (.8 + .3 * fine), smoothstep(.55, .75, sin(r * 5.0 + 2.0) * .5 + .5) * .55);
+    // Thin bright lines where two growths meet
+    col = mix(col, cCol * 1.25, smoothstep(.06, .0, vo.y - vo.x) * .5);
+    col *= .9 + .2 * fbm3(q * 30.0);
+  } else if (uPat == 2) {
+    col = mix(cCol, cCol2, smoothstep(.42, .7, m) * .85);
+    col *= .9 + .2 * fbm3(q * 9.0);
+  } else if (uPat == 3) {
+    // Lapis: deep blue with white calcite clouds and gold pyrite flecks
+    col = cCol * (.75 + .5 * fbm3(q * 5.0));
+    col = mix(col, vec3(.86, .87, .88), smoothstep(.62, .78, fbm3(q * 1.8 + 3.0)) * .8);
+    vec3 vo = voronoi3(q * 14.0);
+    float fleck = smoothstep(.22, .12, vo.x) * step(.72, vo.z);
+    col = mix(col, cCol2, fleck);
+    metal = max(metal, fleck);
+    rough = mix(rough, .18, fleck);
+  } else if (uPat == 4) {
+    // Tiger's eye: parallel fibers with a band of silky light across them
+    vec3 T = normalize(vec3(.1, 1.0, .25));
+    float s = fbm3(vec3(dot(q, vec3(1.0, 0.0, .2)) * 2.0, dot(q, T) * .15, q.z * 2.0));
+    col = mix(cCol2, cCol, smoothstep(.35, .65, s));
+    float fiber = noise3(vec3(dot(q, vec3(1.0, 0.0, .3)) * 60.0, dot(q, T) * 2.0, q.z * 60.0));
+    col *= .85 + .3 * fiber;
+    float th = dot(h, T);
+    add += col * uKeyCol * exp(-th * th * 60.0) * 1.3;
+  } else if (uPat == 5) {
+    // Labradorite: gray with flashes of blue, gold and green at one angle
+    col = cCol * (.55 + .5 * fbm3(q * 3.0));
+    // Thin lamellae: fine stripes in one direction
+    col *= .85 + .15 * sin(dot(q, vec3(40.0, 0.0, 14.0)) + fbm3(q * 5.0) * 4.0);
+    vec3 ln = normalize(vec3(.1, 1.0, .25) + (vec3(fbm3(q * 1.2), 0.0, fbm3(q * 1.2 + 2.0)) - .5) * .7);
+    float flash = pow(max(dot(ln, normalize(h + vec3(0.0, .6, 0.0))), 0.0), 6.0);
+    float hue = fbm3(q * .9 + 7.0);
+    vec3 fc = spectral(hue > .62 ? .86 : .3 + hue * .35);
+    float zone = smoothstep(.38, .58, fbm3(q * .8 + 11.0));
+    add += fc * fc * flash * zone * 1.4 * (uKeyCol * .4 + .5);
+    col = mix(col, fc * .22, zone * .3);
+  } else if (uPat == 6) {
+    // Black opal: a dark body with patches of color. Each patch is a small
+    // grating of silica spheres, so it lights up only at its own angle.
+    // Most patches are green and blue; a few flash orange and red.
+    vec3 w = q + vec3(fbm3(q * 1.6), 0.0, fbm3(q * 1.6 + 3.0)) * .5;
+    vec3 vo = voronoi3(w * 5.0 + 3.0);
+    vec3 cn = normalize(hash33(vec3(vo.z * 91.0, vo.z * 17.0, 5.0)) - .5 + vec3(0.0, 1.6, 0.0));
+    float flash = pow(max(dot(cn, h), 0.0), 18.0) * 2.5 + pow(max(dot(cn, normalize(v + vec3(0.0, .3, 0.0))), 0.0), 4.0) * .35;
+    float hue = .3 + .35 * fbm3(q * .7 + 4.0) + (vo.z - .5) * .2;
+    if (hash12(vec2(vo.z * 53.0, 1.0)) > .9) hue = .9;
+    vec3 fc = spectral(hue);
+    float vein = smoothstep(.2, .45, fbm3(q * .9 + 2.0));
+    float edge = smoothstep(.0, .12, vo.y - vo.x);
+    col = mix(cCol2, cCol * (.8 + .4 * fbm3(q * 4.0)), vein);
+    add += fc * fc * flash * vein * mix(.35, 1.0, edge) * 1.3;
+  } else if (uPat == 8) {
+    // Black veins: rhodonite, serpentine
+    float vn = abs(fbm3(q * 1.6 + 5.0) - .5);
+    float vein = smoothstep(.03, .008, vn) + smoothstep(.012, .002, abs(fbm3(q * 4.0) - .5)) * .7;
+    col = cCol * (.85 + .3 * m);
+    col = mix(col, cCol2, clamp(vein, 0.0, 1.0));
+  } else if (uPat == 9) {
+    // Charoite: silky swirls of light and dark lilac
+    vec3 w = q + vec3(fbm3(q * .7), fbm3(q * .7 + 5.0), fbm3(q * .7 + 9.0)) * 2.4;
+    float s = sin(dot(w, vec3(4.0, 1.0, 2.0)) * 3.0) * .5 + .5;
+    col = mix(cCol, cCol2, s * .7);
+    add += col * uKeyCol * pow(max(dot(h, normalize(vec3(cos(w.x), .5, sin(w.z)))), 0.0), 20.0) * .5;
+  } else if (uPat == 10) {
+    // Wavellite: stars of radiating green fibers
+    vec3 vo = voronoi3(q * 2.6);
+    float ang = atan(q.z, q.x) * 18.0 + vo.z * 40.0;
+    col = cCol * (.75 + .35 * (sin(ang + vo.x * 30.0) * .5 + .5));
+    col = mix(col, cCol * .5, smoothstep(.85, 1.0, vo.x / max(vo.y, .001)));
+  } else if (uPat == 11) {
+    // Widmanstätten: crossed lamellae of kamacite with bright taenite edges
+    vec2 s2 = (q.xz + q.y * .3) * 3.0;
+    float lam = 1.0, tone = 0.0;
+    for (int k = ZERO; k < 3; k++) {
+      float a = float(k) * 1.0472 + .35;
+      vec2 dir = vec2(cos(a), sin(a));
+      float u = dot(s2, dir) + fbm3(vec3(s2 * .6, float(k))) * .8;
+      float id = floor(u);
+      // Each lamella has its own width; a thin bright edge of taenite surrounds it.
+      float w = .25 + .35 * hash12(vec2(id, float(k)));
+      float f = abs(fract(u) - .5);
+      float on = step(f, w * .5) * step(.35, hash12(vec2(id * 1.7, float(k) + 4.0)));
+      lam = min(lam, 1.0 - on * .5);
+      tone += on * (.6 + .4 * hash12(vec2(id, float(k) * 7.0)));
+      lam = min(lam, 1.0 - smoothstep(.02, .0, abs(f - w * .5)) * on * .0);
+      tone += smoothstep(.025, .0, abs(f - w * .5)) * .5;
+    }
+    col = cCol * (.62 + .22 * clamp(tone, 0.0, 1.6)) * (.9 + .2 * fbm3(q * 12.0));
+  } else if (uPat == 12) {
+    // Moonstone: a blue glow that floats under the surface
+    col = cCol * (.9 + .1 * m);
+    float g = pow(max(dot(n, h), 0.0), 2.0);
+    col *= vec3(.84, .88, .96) * (.9 + .1 * fbm3(q * 4.0));
+    col = mix(col, vec3(1.0), smoothstep(.012, .0, abs(fbm3(q * 2.5) - .5)) * .35);
+    add += cCol2 * g * 1.8 * smoothstep(.35, .7, fbm3(q * 1.1 + 3.0));
+  } else if (uPat == 13) {
+    // Sunstone: glitter from tiny plates of hematite
+    col = cCol * (.85 + .3 * m);
+    vec3 vo = voronoi3(q * 26.0);
+    vec3 pn = normalize(hash33(vec3(vo.z * 37.0, 1.0, vo.z * 73.0)) - .5 + vec3(0.0, .7, 0.0));
+    float sp = pow(max(dot(pn, h), 0.0), 300.0) * step(.55, vo.z);
+    add += cCol2 * sp * 9.0;
+    col = mix(col, cCol2 * .7, smoothstep(.12, .05, vo.x) * .3);
+  } else if (uPat == 14) {
+    // Color zones: cubes of fluorite, or the rim and core of tourmaline
+    float z = uZone < .5 ? max(abs(q.x), max(abs(q.y), abs(q.z))) : length(q.xz);
+    float zone = smoothstep(.45, .6, fract(z * 2.2 + m * .3));
+    col = mix(cCol, cCol2, zone);
+  } else if (uPat == 15) {
+    // Turquoise and variscite: a web of dark veins
+    vec3 w = q + (vec3(fbm3(q * 1.7), fbm3(q * 1.7 + 3.0), fbm3(q * 1.7 + 6.0)) - .5) * 1.1;
+    vec3 vo = voronoi3(w * 4.5);
+    float th = .015 + .05 * pow(fbm3(q * 3.0 + 1.0), 2.0);
+    float web = smoothstep(th, th * .3, vo.y - vo.x) * smoothstep(.3, .45, fbm3(q * .9 + 4.0));
+    col = cCol * (.78 + .35 * fbm3(q * 5.0));
+    col = mix(col, cCol * vec3(.8, .95, .85), smoothstep(.55, .7, fbm3(q * 2.2 + 7.0)) * .5);
+    col = mix(col, cCol2, web * .95);
+    rough = mix(rough, .6, web);
+  } else if (uPat == 16) {
+    // Streaks along the crystal: kyanite, amazonite
+    float s = fbm3(vec3(q.x * 9.0, q.y * .6, q.z * 9.0));
+    col = mix(cCol, cCol2, smoothstep(.55, .75, s) * .7);
+  } else if (uPat == 17) {
+    // A silky or glassy sheen: goethite, talc, obsidian
+    col = cCol * (.85 + .3 * m);
+    float sh = pow(max(dot(h, n), 0.0), 8.0) * (.5 + .5 * sin(dot(q, vec3(9.0, 14.0, 6.0)) + m * 6.0));
+    col *= .92 + .16 * sin(dot(q, vec3(5.0, 9.0, 3.0)) + m * 4.0);
+    add += mix(cCol2, cCol2 * 1.5, m) * sh * .6;
+  } else {
+    col = cCol * (.88 + .24 * m);
+  }
+  return col;
+}
+
+// Thin-film color of a tarnished or oxidized metal: bismuth, bornite.
+vec3 tarnish(vec3 q, vec3 n, vec3 v) {
+  float d = 260.0 + 520.0 * fbm3(q * 1.6 + uIndex);
+  return thinFilm(d, clamp(dot(n, v), 0.0, 1.0));
+}
+
+// The material of a surface: everything light() needs, plus light that the
+// surface sends by itself (add) and light that passes through it (glow).
+struct Mat { vec3 alb; float rough; float f0; float metal; float sss; vec3 n; vec3 add; vec3 glow; };
+Mat plain(vec3 alb, float rough, vec3 n) { Mat m; m.alb = alb; m.rough = rough; m.f0 = .04; m.metal = 0.0; m.sss = 0.0; m.n = n; m.add = vec3(0.0); m.glow = vec3(0.0); return m; }
+
+// The opaque, translucent and metallic minerals.
+Mat solidMat(vec3 p, vec3 n, vec3 rd, vec3 q) {
+  vec3 v = -rd;
+  float rough = uRough, metal = uMat == 3 ? 1.0 : 0.0;
+  vec3 add = vec3(0.0);
+  vec3 alb = pattern(q, n, v, rough, add, metal);
+  if (uPat == 7) {
+    // Iridescent metal: the oxide colors the reflection
+    vec3 tf = tarnish(q, n, v);
+    alb = mix(alb, alb * tf * 1.9, uIrid);
+  }
+  // A cut face is polished; the rough faces of a massive stone are not.
+  if (gCutFace > .5) rough = min(rough, .1);
+  else if (uHabit == 2 || uHabit == 6) {
+    rough = max(rough, .5);
+    if (uMat != 3) alb = mix(alb, alb * vec3(.8, .74, .66), .35) * (.85 + .3 * fbm3(q * 7.0));
+  }
+  // Fine grooves along the length of a striated crystal
+  if (uStria > .5 && gStriaAxis != vec3(0.0)) {
+    float st = sin(dot(q, vec3(90.0, 0.0, 70.0)) + noise3(q * 6.0) * 4.0);
+    n = normalize(n + normalize(cross(gStriaAxis, n) + 1e-4) * st * .06);
+  }
+  // Fine bumps on rough surfaces
+  if (gCutFace < .5 && uMat != 0) {
+    vec3 b = vec3(fbm3(q * 20.0), fbm3(q * 20.0 + 4.0), fbm3(q * 20.0 + 8.0)) - .5;
+    n = normalize(n + b * (uHabit == 2 || uHabit == 6 ? .35 : .08));
+  }
+  Mat m = plain(alb, rough, n);
+  m.metal = metal; m.f0 = metal > .5 ? .7 : uF0; m.sss = uMat == 1 ? .8 : 0.0; m.add = add;
+  if (metal > .5) m.metal = uPat == 7 ? mix(.85, .7, uIrid) : .86;
+  if (uMat == 1) {
+    // Light that enters a translucent stone and leaves it on the other side
+    float back = pow(max(dot(-n, normalize(uKeyDir)), 0.0), 2.0) + .25 * pow(1.0 - max(dot(n, v), 0.0), 2.0);
+    m.glow = alb * alb * uKeyCol * back * .5 + alb * uFillCol * .4;
+  }
+  return m;
+}
+`;
+
+// Light through a clear crystal: the scene supplies bodyD, the distance to
+// the crystal that the ray hit, and map for the scene behind it.
+const CLEAR = `
+float marchIn(vec3 ro, vec3 rd) {
+  float t = .004;
+  for (int i = ZERO; i < 48; i++) {
+    float h = -bodyD(ro + rd * t);
+    if (h < .0006) break;
+    t += max(h * .9, .002);
+    if (t > 30.0) break;
+  }
+  return t;
+}
+vec3 bodyNormal(vec3 p) {
+  vec2 k = vec2(1, -1); float e = .0008;
+  return normalize(k.xyy * bodyD(p + k.xyy * e) + k.yyx * bodyD(p + k.yyx * e) + k.yxy * bodyD(p + k.yxy * e) + k.xxx * bodyD(p + k.xxx * e));
+}
+// What a ray sees after it leaves the crystal: the floor or the backdrop
+// behind it, lit without shadows, or the room.
+vec3 behind(vec3 ro, vec3 rd) {
+  float t = 1e9; vec3 n = vec3(0.0, 1.0, 0.0);
+  if (rd.y < -1e-3) t = -ro.y / rd.y;
+  if (uCove.x > 0.0 && rd.z < -1e-3) { float tw = (-uCove.x - ro.z) / rd.z; if (tw < t) { t = tw; n = vec3(0.0, 0.0, 1.0); } }
+  if (t > 1e8) return env(rd);
+  vec3 p = ro + rd * t;
+  float nl = max(dot(n, normalize(uKeyDir)), 0.0);
+  return floorColor(p) * (uKeyCol * nl * .8 + uFillCol * 1.2);
+}
+// Small clear crystals in a geode or a druse: glossy faces, and color that
+// glows where light passes through.
+Mat glassyMat(vec3 pos, vec3 n, vec3 rd) {
+  vec3 v = -rd, key = normalize(uKeyDir);
+  float F = schlick(clamp(dot(n, v), 0.0, 1.0), .05);
+  Mat m = plain(cCol * .55, .04, n);
+  m.f0 = .05; m.sss = .6;
+  float back = pow(max(dot(-n, key), 0.0), 1.5) + .35 * pow(1.0 - max(dot(n, v), 0.0), 3.0);
+  m.glow = cCol * cCol * uKeyCol * back * .9 * (1.0 - F) + cCol * uFillCol * .6;
+  return m;
+}
+vec3 shadeClear(vec3 pos, vec3 n, vec3 rd, vec3 q) {
+  float ior = uIor + (uChan - 1.0) * uDisp;
+  vec3 v = -rd, key = normalize(uKeyDir);
+  float f0 = pow((ior - 1.0) / (ior + 1.0), 2.0);
+  float F = schlick(clamp(dot(n, v), 0.0, 1.0), f0);
+  vec3 col = env(reflect(rd, n)) * F;
+  float sp = ggx(n, normalize(key + v), .03) * F;
+  float sh = softShadow(pos + n * .004, key, uSoft);
+  col += uKeyCol * sp * (.3 + .7 * sh);
+  gSpec += sp * (.3 + .7 * sh);
+  // The body color: a zoned crystal changes color with the place.
+  vec3 body = cCol;
+  if (uPat == 14) {
+    float z = uZone < .5 ? max(abs(q.x), max(abs(q.y), abs(q.z))) : length(q.xz) * 1.4;
+    body = mix(cCol, cCol2, smoothstep(.45, .6, fract(z * 2.2)));
+  }
+  vec3 sigma = -log(clamp(body, .015, .98)) * uSigmaK;
+  vec3 thr = vec3(1.0 - F);
+  vec3 p = pos - n * .003;
+  vec3 dir = refract(rd, n, 1.0 / ior);
+  for (int b = ZERO; b < 4; b++) {
+    if (float(b) >= uBounces) break;
+    float t = marchIn(p, dir);
+    vec3 pe = p + dir * t;
+    vec3 ne = bodyNormal(pe);
+    thr *= exp(-sigma * t);
+    // Fine scattering makes pale crystals glow a little inside.
+    col += thr * body * (uFillCol * .15 + uKeyCol * .035) * (1.0 - exp(-t * .4));
+    vec3 o = refract(dir, -ne, ior);
+    if (dot(o, o) < 1e-5) { dir = reflect(dir, -ne); p = pe - ne * .003; continue; }
+    float Fe = schlick(clamp(dot(o, ne), 0.0, 1.0), f0);
+    col += thr * (1.0 - Fe) * behind(pe + ne * .004, o);
+    thr *= Fe;
+    if (max(thr.x, max(thr.y, thr.z)) < .02) break;
+    dir = reflect(dir, -ne); p = pe - ne * .003;
+  }
+  return col;
+}
+`;
+
+// The camera and the accumulation of one sample. A clear mineral with
+// dispersion traces one color channel in each sample.
+const MAIN = `
+void main() {
+  gSpec = 0.0; gShadowK = uSoft; gShadowMix = 0.0;
+  vec3 ro = uCamPos;
+  vec3 ww = normalize(uCamTarget - ro), uu = normalize(cross(ww, vec3(0, 1, 0))), vv = cross(uu, ww);
+  float spin = hash12(gl_FragCoord.xy * .713 + 3.1) * 6.2831;
+  vec2 lens = rot(spin) * uLens;
+  vec2 jit = fract(uJitter + hash22(gl_FragCoord.xy * .291)) - .5;
+  vec2 p = (2.0 * (gl_FragCoord.xy + jit) - uRes) / uRes.y;
+  vec3 rd = normalize(p.x * uu + p.y * vv + uFocal * ww);
+  vec3 fp = ro + rd * (uFocus / dot(rd, ww));
+  ro += (uu * lens.x + vv * lens.y) * uAperture;
+  rd = normalize(fp - ro);
+  vec3 col = render(ro, rd);
+  if (uMask > .5) col = vec3(1.0 - exp(-gSpec * .25));
+  else if (uDisp > 0.0) col *= (uChan < .5 ? vec3(3.0, 0.0, 0.0) : uChan < 1.5 ? vec3(0.0, 3.0, 0.0) : vec3(0.0, 0.0, 3.0));
+  outColor = vec4(max(col, 0.0), 1.0);
+}`;
+
+// ---------- scenes ----------
+
+const SCENES = {};
+
+// The specimen. uHabit picks the body:
+//   0 crystals, needles, books or crosses from the instances
+//   1 botryoidal: smooth balls
+//   2 massive: a rough stone with a polished face
+//   3 geode: a broken stone lined with crystals
+//   4 druse: tiny crystals on a plate of rock
+//   5 nugget
+//   6 meteorite: an iron with a polished, etched face
+//   7 dendrite: branches and wires
+//   8 hopper and needle balls: instances without smoothing
+SCENES.specimen = `
+int gInst; float gPart; vec3 gCellP; vec4 gCellQ; float gCellS;
+float sdCove(vec3 p) {
+  float W = uCove.x, R = uCove.y, zc = R - W;
+  if (p.z >= zc) return min(p.y, p.z + W);
+  if (p.y >= R) return p.z + W;
+  return R - length(vec2(p.z - zc, p.y - R));
+}
+vec3 floorColor(vec3 p) {
+  float rough; vec3 bump;
+  vec3 c = tableColor(p, rough, bump);
+  // A pool of light around the specimen, and a soft glow on the backdrop
+  // behind it, so clear crystals have light to show through them.
+  float spot = exp(-dot(p.xz - vec2(0.0, -1.0), p.xz - vec2(0.0, -1.0)) / 70.0);
+  c *= mix(uDay > .5 ? .75 : .35, 1.0, spot);
+  float glow = exp(-(p.x * p.x / 90.0 + (p.y - 3.5) * (p.y - 3.5) / 40.0)) * smoothstep(-6.0, -12.0, p.z);
+  return c + glow * (uDay > .5 ? vec3(.12) : mix(cBg, cAccent, .45) * 1.3);
+}
+// Massive stone: a lumpy body with a flat polished cut.
+float rockBound(vec3 q) { return (length(q / uRockS) - 1.5) * min(uRockS.x, min(uRockS.y, uRockS.z)); }
+float massiveD(vec3 p, float lim) {
+  vec3 q = p - uRock.xyz;
+  if (rockBound(q) > lim) return lim;
+  float d = sdEllipsoid(q, uRockS);
+  // Flat breaks, as where the stone split from a larger mass
+  float ms = min(uRockS.x, min(uRockS.y, uRockS.z));
+  for (int k = ZERO; k < 5; k++) {
+    vec3 nn = normalize(hash33(vec3(uIndex * .7, float(k), 9.0)) - .5 + vec3(0.0, .15, 0.0));
+    if (dot(nn, uCut.xyz) > .6) continue;
+    d = max(d, (dot(q / uRockS, nn) - (.55 + .2 * hash13(vec3(float(k), uIndex, 4.0)))) * ms);
+  }
+  d += (fbm3(q * .55 + uIndex) - .5) * .45 + (fbm3l(q * 2.3) - .5) * .1;
+  d = max(d, dot(q, uCut.xyz) - uCut.w);
+  return max(d, -p.y);
+}
+float nuggetD(vec3 p, float lim) {
+  vec3 q = p - uRock.xyz;
+  if (rockBound(q) - .6 > lim) return lim;
+  float d = sdEllipsoid(q, uRockS);
+  d = smin(d, sdEllipsoid(q - vec3(uRockS.x * .55, -.1, .3), uRockS * .62), .8);
+  d = smin(d, sdEllipsoid(q + vec3(uRockS.x * .5, .15, -.2), uRockS * .55), .8);
+  d += (fbm3(q * .9 + uIndex) - .5) * .8 + (noise3(q * 6.0) - .5) * .05;
+  return max(d * .8, -p.y);
+}
+float meteoriteD(vec3 p, float lim) {
+  vec3 q = p - uRock.xyz;
+  if (rockBound(q) > lim) return lim;
+  float d = sdEllipsoid(q, uRockS);
+  // Thumbprint hollows from the flight through the air
+  vec3 vo = voronoi3(q * .75 + 7.0);
+  d += (fbm3(q * .5) - .5) * .6 + smoothstep(.0, .8, .8 - vo.x) * .18;
+  d = max(d, dot(q, uCut.xyz) - uCut.w);
+  return max(d, -p.y);
+}
+// One crystal that grows from a cell of the geode or the druse.
+float cellCrystal(vec3 p, vec3 base, vec4 qr, float s) {
+  vec3 q = qinv(qr, p - base) / s;
+  return (poly(q) - uRound) * s;
+}
+float geodeD(vec3 p, float lim) {
+  vec3 c = p - uRock.xyz;
+  float Ro = uRock.w, Ri = Ro * .76;
+  gPart = 0.0;
+  if (length(c) - Ro * 1.2 > lim) return lim;
+  float shell = length(c * vec3(1.0, 1.08, 1.0)) - Ro + (fbm3(c * .8 + uIndex) - .5) * .5;
+  float inner = length(c) - Ri;
+  float cut = dot(c, uCut.xyz) - uCut.w;
+  float d = max(max(shell, -inner), cut);
+  d = max(d, -p.y);
+  gPart = 0.0;
+  // Crystals that line the hollow and point to the middle
+  float best = 1e9;
+  if (inner < .9) {
+    vec3 dir = normalize(c);
+    float th = acos(clamp(dir.y, -1.0, 1.0)), ph = atan(dir.z, dir.x);
+    vec2 g = vec2(ph / 6.2832 * 26.0, th / 3.1416 * 13.0);
+    vec2 cell = floor(g);
+    for (int j = ZERO - 1; j <= 1; j++) for (int i = ZERO - 1; i <= 1; i++) {
+      vec2 cc = cell + vec2(i, j);
+      if (cc.y < 0.0 || cc.y > 12.0) continue;
+      vec2 hh = hash22(cc + uIndex * .37);
+      vec2 cg = cc + .2 + hh * .6;
+      float cph = cg.x / 26.0 * 6.2832, cth = cg.y / 13.0 * 3.1416;
+      vec3 cd = vec3(sin(cth) * cos(cph), cos(cth), sin(cth) * sin(cph));
+      vec3 axis = normalize(-cd + (hash33(vec3(cc, 3.0)) - .5) * .7);
+      float s = Ri * (.17 + .08 * hash12(cc + 9.0));
+      vec3 base = uRock.xyz + cd * (Ri + s * .4);
+      vec4 qr = qmul(qFromY(axis), qAxis(vec3(0.0, 1.0, 0.0), hh.x * 6.0));
+      float dc = max(cellCrystal(p, base, qr, s), cut);
+      if (dc < best) { best = dc; gCellP = base; gCellQ = qr; gCellS = s; }
+    }
+  }
+  if (best < d && best < lim) { gPart = 1.0; return best; }
+  return min(d, lim);
+}
+// A plate of dark rock with broken sides and a flat top, covered with a crust
+// of tiny crystals.
+float druseD(vec3 p, float lim) {
+  vec3 q = p - uRock.xyz;
+  gPart = 0.0;
+  if (rockBound(q) > lim) return lim;
+  float topH = uRockS.y * .5;
+  float ms = min(uRockS.x, min(uRockS.y, uRockS.z));
+  float rock = max(sdEllipsoid(q, uRockS), q.y - topH);
+  for (int k = ZERO; k < 4; k++) {
+    float a = float(k) * 1.5708 + hash12(vec2(uIndex, float(k))) * .8;
+    vec3 nn = normalize(vec3(cos(a), .15, sin(a)));
+    rock = max(rock, (dot(q / uRockS, nn) - .78) * ms);
+  }
+  rock += (fbm3l(q * 3.0) - .5) * .06;
+  rock = max(rock, -p.y);
+  if (q.y > topH + .5 || rock > 1.0) return min(rock, lim);
+  float best = 1e9;
+  float cs = .2;
+  vec2 g = q.xz / cs, cell = floor(g);
+  for (int j = ZERO - 1; j <= 1; j++) for (int i = ZERO - 1; i <= 1; i++) {
+    vec2 cc = cell + vec2(i, j);
+    vec2 hh = hash22(cc + 4.1);
+    vec2 cxz = (cc + .5 + (hh - .5) * .7) * cs;
+    // Only on the top of the plate, inside its outline
+    float k = (cxz.x / uRockS.x) * (cxz.x / uRockS.x) + (cxz.y / uRockS.z) * (cxz.y / uRockS.z);
+    if (k > .62) continue;
+    float s = .1 + .07 * hash12(cc + 1.7);
+    vec3 base = vec3(uRock.x + cxz.x, uRock.y + topH + s * .15, uRock.z + cxz.y);
+    vec4 qr = qAxis(normalize(hash33(vec3(cc, 2.0)) - .5), hh.y * 6.0);
+    float dc = cellCrystal(p, base, qr, s);
+    if (dc < best) { best = dc; gCellP = base; gCellQ = qr; gCellS = s; }
+  }
+  if (best < rock && best < lim) { gPart = 1.0; return best; }
+  return min(rock, lim);
+}
+float mineralD(vec3 p, float lim) {
+  gInst = -1; gPart = 0.0;
+  if (uHabit == 2) return massiveD(p, lim);
+  if (uHabit == 3) return geodeD(p, lim);
+  if (uHabit == 4) return druseD(p, lim);
+  if (uHabit == 5) return nuggetD(p, lim);
+  if (uHabit == 6) return meteoriteD(p, lim);
+  bool blend = uHabit == 1 || uHabit == 7;
+  float k = uHabit == 1 ? .45 : .12;
+  float best = 1e9;
+  for (int i = ZERO; i < 24; i++) {
+    if (i >= uIN) break;
+    // A part whose bounding sphere is farther than the result so far cannot
+    // change it. Using the sphere as a distance would leave rings in the
+    // shadows and the occlusion.
+    if (instBound(p, i) > min(best, lim) + (blend ? k : 0.0)) continue;
+    float d = instD(p, i);
+    if (d < best || (blend && d < best + k)) { if (d < best) gInst = i; best = blend ? smin(best, d, k) : min(best, d); }
+  }
+  best = min(best, lim);
+  if (uHabit == 1 && uCut.w > -50.0) best = max(best, dot(p - uRock.xyz, uCut.xyz) - uCut.w);
+  return best;
+}
+vec2 map(vec3 p) {
+  vec2 res = vec2(sdCove(p), 1.0);
+  if (uRock.w > 0.0 && uHabit != 2 && uHabit != 3 && uHabit != 4 && uHabit != 5 && uHabit != 6) {
+    float b = (length((p - uRock.xyz) / uRockS) - 1.5) * min(uRockS.x, min(uRockS.y, uRockS.z));
+    if (b < res.x) { float r = rockD(p); if (r < res.x) res = vec2(r, 2.0); }
+  }
+  float m = mineralD(p, res.x);
+  if (m < res.x) res = vec2(m, 3.0);
+  return res;
+}
+// The distance to the part that the ray hit, for the path through a clear crystal.
+int hInst; float hPart; vec3 hCellP; vec4 hCellQ; float hCellS;
+float bodyD(vec3 p) {
+  if (hPart > .5) return cellCrystal(p, hCellP, hCellQ, hCellS);
+  if (hInst >= 0) return instD(p, hInst);
+  return mineralD(p, 1e9);
+}
+${MARCH}
+${MINERAL}
+${CLEAR}
+vec3 render(vec3 ro, vec3 rd) {
+  vec2 h = march(ro, rd, 90.0);
+  if (h.y < 0.0) return env(rd);
+  vec3 pos = ro + rd * h.x, n = calcNormal(pos, h.x);
+  Mat m;
+  gShadowK = h.y < 1.5 ? mix(uSoft, 1.2, smoothstep(-1.0, -7.0, pos.z)) : uSoft;
+  gShadowMix = h.y < 1.5 ? smoothstep(-3.0, -9.0, pos.z) * .8 : 0.0;
+  if (h.y < 1.5) {
+    float rough; vec3 bump;
+    vec3 albedo = floorColor(pos);
+    tableColor(pos, rough, bump);
+    m = plain(albedo, rough, normalize(n + bump));
+    m.f0 = .035;
+  } else if (h.y < 2.5) {
+    vec3 q = pos - uRock.xyz;
+    float g = fbm3(q * 4.0);
+    vec3 albedo = cMtx * (.55 + .6 * g) * (.8 + .4 * noise3(q * 40.0));
+    // Stains and a second tone, as in a real host rock
+    albedo = mix(albedo, albedo * vec3(.62, .52, .42), smoothstep(.45, .62, fbm3(q * 1.5 + 5.0)) * .8);
+    albedo = mix(albedo, cMtx * 1.35, smoothstep(.6, .68, fbm3(q * 3.0 + 9.0)) * .5);
+    vec3 vo = voronoi3(q * 14.0);
+    albedo *= .75 + .5 * step(.85, vo.z) + .15 * smoothstep(.15, .03, vo.x);
+    vec3 b = vec3(fbm3(q * 14.0), fbm3(q * 14.0 + 4.0), fbm3(q * 14.0 + 8.0)) - .5;
+    m = plain(albedo, .82, normalize(n + b * .6));
+  } else {
+    mineralD(pos, 1e9);
+    hInst = gInst; hPart = gPart; hCellP = gCellP; hCellQ = gCellQ; hCellS = gCellS;
+    vec3 q;
+    if (gPart > .5) q = qinv(gCellQ, pos - gCellP) / gCellS;
+    else if (gInst >= 0) q = qinv(uQ[gInst], pos - uI[gInst].xyz) / uI[gInst].w;
+    else q = pos - uRock.xyz;
+    gStriaAxis = gInst >= 0 ? qrot(uQ[gInst], vec3(0.0, 1.0, 0.0)) : vec3(0.0);
+    gCutFace = 0.0;
+    if ((uHabit == 1 || uHabit == 2 || uHabit == 6) && uCut.w > -50.0 && abs(dot(pos - uRock.xyz, uCut.xyz) - uCut.w) < .01) gCutFace = 1.0;
+    if (uHabit == 3 && gPart < .5) {
+      // The shell of a geode: gray outside, and bands of chalcedony on the cut
+      vec3 c = pos - uRock.xyz;
+      float r = length(c) / uRock.w;
+      bool onCut = abs(dot(c, uCut.xyz) - uCut.w) < .02;
+      m = plain(cMtx * (.7 + .5 * fbm3(c * 2.0)), .8, n);
+      if (onCut) {
+        float b = sin(r * 90.0 + fbm3(c * 3.0) * 5.0) * .5 + .5;
+        vec3 chal = mix(vec3(.42, .45, .5), vec3(.78, .78, .8), smoothstep(.3, .8, b));
+        chal = mix(chal, mix(cCol, vec3(.7), .5), smoothstep(.84, .78, r) * .5);
+        m.alb = mix(chal, cMtx * .7, smoothstep(.9, .97, r));
+        m.rough = .12; m.sss = .3;
+      }
+    } else if (uHabit == 4 && gPart < .5) {
+      m = plain(cMtx * (.6 + .5 * fbm3((pos - uRock.xyz) * 2.0)), .8, n);
+    } else if (uMat == 0 && gPart < .5) {
+      return shadeClear(pos, n, rd, q);
+    } else if (uMat == 0) {
+      m = glassyMat(pos, n, rd);
+    } else {
+      m = solidMat(pos, n, rd, q);
+    }
+  }
+  return light(pos, m.n, rd, m.alb, m.rough, m.f0, m.metal, m.sss) + m.glow + m.add;
+}
+${MAIN}`;
+
+// The Omarchy wordmark spelled in pieces of the mineral, and rough pieces
+// from a low angle. Each cell of a grid holds at most one piece. uPiece picks
+// the shape: 0 a crystal from the habit planes, 1 a tumbled stone, 2 a
+// broken chunk, 3 a nugget, 4 a ball of needles, 5 a hopper crystal.
+const FIELD = `
+uniform float uWord;
+float sdLogo2D(vec2 q) {
+  vec2 px = q * uLogoInfo.z + uLogoInfo.w;
+  vec2 uv = px / uLogoInfo.xy;
+  vec2 o = max(max(-uv, uv - 1.0), 0.0) * uLogoInfo.xy / uLogoInfo.z;
+  return texture(uLogo, clamp(uv, 0.0, 1.0)).r + length(o);
+}
+vec3 gCenter; vec4 gRot; float gSize; vec2 gCellId;
+float pieceD(vec3 q, vec2 c) {
+  if (uPiece == 0) return poly(q) - uRound;
+  if (uPiece == 6) return min(poly(q), poly(vec3(q.y, -q.x, q.z))) - uRound;
+  if (uPiece == 7) { float d = poly(q); for (int k = ZERO + 1; k < 3; k++) { vec3 r2 = q; r2.xz = rot(float(k) * 1.0472) * r2.xz; d = min(d, poly(r2)); } return d - uRound; }
+  if (uPiece == 1) return sdEllipsoid(q, vec3(1.0, .55, .78)) + (noise3(q * 1.6 + c.xyx) - .5) * .12;
+  if (uPiece == 2) {
+    // A broken chunk: an ellipsoid with 4 flat breaks
+    float d = sdEllipsoid(q, vec3(.95, .6, .8));
+    for (int k = ZERO; k < 4; k++) {
+      vec3 h3 = hash33(vec3(c, float(k)));
+      vec3 nn = normalize(h3 - .5 + vec3(0.0, k == 0 ? .8 : 0.0, 0.0));
+      d = max(d, dot(q, nn) - (.38 + .25 * h3.z));
+    }
+    return d;
+  }
+  if (uPiece == 3) return (sdEllipsoid(q, vec3(1.0, .6, .8)) + (fbm3l(q * 1.8 + c.xyx) - .5) * .35) * .8;
+  if (uPiece == 4) return spikyD(q, .8);
+  return hopperD(q * 1.4) / 1.4;
+}
+// Puts the piece of cell c at its place: it rests on the table with a random turn.
+float cellPiece(vec3 p, vec2 c, float layer, float scale, out vec3 center, out vec4 qr, out float s) {
+  vec2 h = hash22(c + layer * 31.7 + uIndex * 1.3);
+  vec2 xz = (c + .5 + (h - .5) * .5) * scale - layer * scale * .5;
+  s = scale * uPieceK * (.85 + .3 * hash12(c * 1.7 + layer * 4.0));
+  qr = qmul(qAxis(vec3(0.0, 1.0, 0.0), hash12(c * 4.1 + layer) * 6.2831), uRest);
+  // A small tilt, so the pieces do not look placed by a machine
+  qr = qmul(qAxis(normalize(vec3(hash12(c * 9.3), 0.0, hash12(c * 7.1)) - vec3(.5, 0.0, .5) + vec3(1e-3, 0.0, 0.0)), (hash12(c * 3.3 + layer) - .5) * .25), qr);
+  center = vec3(xz.x, uRestH * s + layer * scale * .38, xz.y);
+  vec3 q = qinv(qr, p - center) / s;
+  return pieceD(q, c) * s;
+}
+float fieldD(vec3 p, float lim) {
+  float best = lim;
+  float scale = uWord > .5 ? .9 : 1.15;
+  for (int layer = ZERO; layer < 2; layer++) {
+    float off = float(layer) * scale * .5;
+    vec2 q = (p.xz + off) / scale;
+    vec2 base = floor(q) - 1.0;
+    for (int j = ZERO; j < 3; j++) for (int i = ZERO; i < 3; i++) {
+      vec2 c = base + vec2(i, j);
+      vec2 h = hash22(c + float(layer) * 31.7 + uIndex * 1.3);
+      if (uWord > .5) {
+        vec2 xz = (c + .5 + (h - .5) * .5) * scale - float(layer) * scale * .5;
+        float inside = sdLogo2D(vec2(xz.x * uLogoK + 607.5, xz.y * uLogoK + 142.5));
+        if (layer == 0 && inside > -5.0 && hash12(c * 5.3) > .012) continue;
+        if (layer == 1 && (inside > -12.0 || hash12(c * 2.3 + 9.0) > .5)) continue;
+      } else if (layer == 1 && hash12(c * 2.3 + 11.0) > .45) continue;
+      vec3 center; vec4 qr; float s;
+      // A tight sphere around the piece: its true middle and its own size
+      vec2 cxz = (c + .5 + (h - .5) * .5) * scale - float(layer) * scale * .5;
+      float cs = scale * uPieceK * (.85 + .3 * hash12(c * 1.7 + float(layer) * 4.0));
+      float bound = length(p - vec3(cxz.x, uRestH * cs + float(layer) * scale * .38, cxz.y)) - cs * uPieceR;
+      if (bound > best) continue;
+      float d = cellPiece(p, c, float(layer), scale, center, qr, s);
+      if (d < best) { best = d; gCenter = center; gRot = qr; gSize = s; gCellId = c + float(layer) * 100.0; }
+    }
+  }
+  return best;
+}
+vec3 floorColor(vec3 p) { float rough; vec3 bump; return tableColor(p, rough, bump); }
+vec2 map(vec3 p) {
+  vec2 res = vec2(p.y, 1.0);
+  if (p.y < 1.9) { float b = fieldD(p, res.x); if (b < res.x) res = vec2(b, 3.0); }
+  else res.x = min(res.x, p.y - 1.5);
+  return res;
+}
+vec3 hCenter; vec4 hRot; float hSize; vec2 hCell;
+float bodyD(vec3 p) { vec3 q = qinv(hRot, p - hCenter) / hSize; return pieceD(q, hCell) * hSize; }
+${MARCH}
+${MINERAL}
+${CLEAR}
+vec3 render(vec3 ro, vec3 rd) {
+  // The rough pieces fade into the room far away, where the focus blurs them.
+  vec2 h = march(ro, rd, uWord > .5 ? 140.0 : 60.0);
+  if (uDbg == 4.0) return vec3(h.x * .01);
+  if (h.y < 0.0) return env(rd);
+  vec3 pos = ro + rd * h.x, n = calcNormal(pos, h.x);
+  Mat m;
+  if (h.y > 2.5) {
+    fieldD(pos, 1e9);
+    hCenter = gCenter; hRot = gRot; hSize = gSize; hCell = mod(gCellId, 100.0);
+    vec3 q = qinv(gRot, pos - gCenter) / gSize;
+    gCutFace = uPiece == 1 ? 1.0 : 0.0;
+    if (uMat == 0 && uWord < .5) return shadeClear(pos, n, rd, q);
+    if (uMat == 0) m = glassyMat(pos, n, rd);
+    else m = solidMat(pos, n, rd, q + vec3(hash12(gCellId) * 9.0, 0.0, 0.0));
+  } else {
+    float rough; vec3 bump;
+    vec3 albedo = tableColor(pos, rough, bump);
+    m = plain(albedo, rough, normalize(n + bump));
+    m.f0 = .035;
+  }
+  return light(pos, m.n, rd, m.alb, m.rough, m.f0, m.metal, m.sss) + m.glow + m.add;
+}
+${MAIN}`;
+SCENES.wordmark = FIELD;
+SCENES.rough = FIELD;
+
+// A cut gem on a table, and a second gem behind it out of focus.
+SCENES.gem = `
+int gInst;
+float gemD(vec3 p, float lim) {
+  float best = lim; gInst = 0;
+  for (int i = ZERO; i < 2; i++) {
+    if (i >= uIN) break;
+    vec4 I = uI[i];
+    if (length(p - I.xyz) - I.w * 1.32 > best) continue;
+    vec3 q = qinv(uQ[i], p - I.xyz) / I.w;
+    float d = poly(q) * I.w;
+    if (d < best) { best = d; gInst = i; }
+  }
+  return best;
+}
+vec3 floorColor(vec3 p) { float rough; vec3 bump; return tableColor(p, rough, bump); }
+vec2 map(vec3 p) {
+  vec2 res = vec2(p.y, 1.0);
+  float g = gemD(p, res.x);
+  if (g < res.x) res = vec2(g, 3.0);
+  return res;
+}
+int hInst;
+float bodyD(vec3 p) { vec4 I = uI[hInst]; vec3 q = qinv(uQ[hInst], p - I.xyz) / I.w; return poly(q) * I.w; }
+${MARCH}
+${MINERAL}
+${CLEAR}
+vec3 render(vec3 ro, vec3 rd) {
+  vec2 h = march(ro, rd, 120.0);
+  if (h.y < 0.0) return env(rd);
+  vec3 pos = ro + rd * h.x, n = calcNormal(pos, h.x);
+  if (h.y > 2.5) {
+    gemD(pos, 1e9); hInst = gInst;
+    vec3 q = qinv(uQ[gInst], pos - uI[gInst].xyz) / uI[gInst].w;
+    return shadeClear(pos, n, rd, q);
+  }
+  float rough; vec3 bump;
+  vec3 albedo = tableColor(pos, rough, bump);
+  vec3 col = light(pos, normalize(n + bump), rd, albedo, rough, .04, 0.0, 0.0);
+  // Light that passes through the gem lands on the table in its color.
+  vec3 toGem = uI[0].xyz - pos;
+  float caust = exp(-dot(toGem.xz - vec2(-.9, .5) * uI[0].w, toGem.xz - vec2(-.9, .5) * uI[0].w) / (uI[0].w * uI[0].w * 1.1));
+  col += cCol * uKeyCol * caust * .35 * smoothstep(0.0, .4, uI[0].w * 1.6 - length(toGem.xz));
+  return col;
+}
+${MAIN}`;
+
+// A close-up of a polished slab. The surface is flat, so a ray hits it in one
+// step. A slice of watermelon tourmaline lies on a table instead.
+SCENES.slab = `
+uniform float uSlice;
+float gemD(vec3 p, float lim) { return lim; }
+vec3 floorColor(vec3 p) { float rough; vec3 bump; return tableColor(p, rough, bump); }
+vec2 map(vec3 p) { return vec2(p.y, 3.0); }
+float bodyD(vec3 p) { return p.y; }
+${MARCH}
+${MINERAL}
+// A rounded triangle, the cross-section of a tourmaline.
+float sliceD(vec2 p) {
+  float d = -1e9;
+  for (int k = ZERO; k < 3; k++) { float a = float(k) * 2.0944 + 1.5708; d = max(d, dot(p, vec2(cos(a), sin(a)))); }
+  return smax(d - 2.1, length(p) - 3.2, 1.2);
+}
+vec3 render(vec3 ro, vec3 rd) {
+  if (rd.y > -.001) return env(rd);
+  float t = -ro.y / rd.y;
+  vec3 pos = ro + rd * t;
+  vec3 v = -rd, key = normalize(uKeyDir);
+  vec3 q = vec3(pos.x, 0.0, pos.z) * .45 + vec3(uIndex * 1.7, 0.0, uIndex * .3);
+  vec3 n = vec3(0.0, 1.0, 0.0);
+  float rough = .06, metal = uMat == 3 ? 1.0 : 0.0;
+  vec3 add = vec3(0.0);
+  vec3 alb;
+  if (uSlice > .5) {
+    // A slice of tourmaline: a pink core, a white band and a green rim
+    vec2 sp = pos.xz - vec2(1.0, -1.2);
+    float sd = sliceD(sp);
+    if (sd > 0.0) {
+      vec3 tc = tableColor(pos, rough, add);
+      float sh = smoothstep(0.0, .5, sd);
+      return tc * (uKeyCol * .55 * mix(.55, 1.0, sh) + uFillCol);
+    }
+    float r = clamp(-sd, 0.0, 3.0);
+    float g = fbm2(sp * 3.0) * .2;
+    alb = mix(cCol2 * 1.1, vec3(.92, .9, .84), smoothstep(.32, .5, r + g));
+    alb = mix(alb, cCol, smoothstep(.62, .85, r + g));
+    alb *= .85 + .3 * fbm2(sp * 9.0);
+    // The slice is thin, so light from the table glows through it.
+    vec3 col = alb * (uKeyCol * .55 + uFillCol * 1.4) + alb * alb * .45;
+    float F = schlick(max(v.y, 0.0), .05);
+    col += env(reflect(rd, n)) * F + uKeyCol * ggx(n, normalize(key + v), .08) * F;
+    return col;
+  }
+  gCutFace = 1.0;
+  alb = pattern(q, n, v, rough, add, metal);
+  if (uPat == 7) alb = mix(alb, alb * tarnish(q, n, v) * 1.5, .55);
+  // Polishing leaves soft hollows where the stone is softer.
+  float e = .02;
+  float h0 = fbm2(q.xz * 3.0), hx = fbm2(q.xz * 3.0 + vec2(e, 0.0)) - h0, hz = fbm2(q.xz * 3.0 + vec2(0.0, e)) - h0;
+  n = normalize(vec3(-hx / e * .02, 1.0, -hz / e * .02));
+  float nl = max(dot(n, key), 0.0);
+  float f0 = metal > .5 ? .65 : .045;
+  vec3 col = alb * (1.0 - metal) * (uKeyCol * nl * .75 + uFillCol * 1.1);
+  vec3 sc = mix(vec3(1.0), alb, metal);
+  float fr = schlick(max(dot(n, v), 0.0), f0);
+  col += env(reflect(rd, n)) * fr * sc * (1.0 - rough) * (metal > .5 ? .55 : .3);
+  col += uKeyCol * sc * ggx(n, normalize(key + v), max(rough, .04)) * schlick(max(dot(normalize(key + v), v), 0.0), f0) * nl;
+  return col + add;
+}
+${MAIN}`;
+
+// ---------- the renderer ----------
+
+function program(scene) {
+  const name = scene === 'glint' || scene === 'macro' ? 'specimen' : scene;
+  if (programs[name]) return programs[name];
+  const compile = (type, src) => {
+    const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(`${name}: ${gl.getShaderInfoLog(s)}`);
+    return s;
+  };
+  const prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, COMMON + TABLE + SCENES[name]));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(`${name}: ${gl.getProgramInfoLog(prog)}`);
+  const post = gl.createProgram();
+  gl.attachShader(post, compile(gl.VERTEX_SHADER, VERT));
+  gl.attachShader(post, compile(gl.FRAGMENT_SHADER, POST));
+  gl.linkProgram(post);
+  if (!gl.getProgramParameter(post, gl.LINK_STATUS)) throw new Error(`post: ${gl.getProgramInfoLog(post)}`);
+  return (programs[name] = { prog, post });
+}
+
+// Tone curve, color grade, vignette and grain. The glint mask skips them.
+const POST = `#version 300 es
+precision highp float;
+uniform sampler2D uAccum;
+uniform float uSamples, uDay, uSeed, uMask;
+uniform vec2 uRes;
+uniform vec3 cShadow, cHigh;
+out vec4 outColor;
+vec3 aces(vec3 x) { return clamp((x * (2.51 * x + .03)) / (x * (2.43 * x + .59) + .14), 0.0, 1.0); }
+float hash12(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * .1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
+void main() {
+  vec2 uv = gl_FragCoord.xy / uRes;
+  vec3 c = texture(uAccum, uv).rgb / uSamples;
+  if (uMask > .5) { outColor = vec4(vec3(clamp(c.r, 0.0, 1.0)), 1.0); return; }
+  c = aces(c * (uDay > .5 ? 1.0 : 1.12));
+  c = pow(c, vec3(1.0 / 2.2));
+  float l = dot(c, vec3(.2126, .7152, .0722));
+  c = mix(vec3(l), c, .92);
+  c = mix(c, c * cShadow * 2.0, (1.0 - smoothstep(0.0, .45, l)) * .22);
+  c = mix(c, c * cHigh * 1.6, smoothstep(.55, 1.0, l) * .12);
+  vec2 q = uv - .5;
+  c *= 1.0 - (uDay > .5 ? .22 : .42) * pow(length(q * vec2(1.0, .8)) * 1.35, 2.4);
+  c += (hash12(gl_FragCoord.xy + uSeed) - .5) * (uDay > .5 ? .01 : .014);
+  outColor = vec4(clamp(c, 0.0, 1.0), 1.0);
+}`;
+
+function texture(w, h, internal, format, type) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, internal, w, h, 0, format, type, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  return t;
+}
+
+// Halton numbers spread the samples evenly over the pixel and the lens.
+function halton(i, b) { let f = 1, r = 0; while (i > 0) { f /= b; r += f * (i % b); i = Math.floor(i / b); } return r; }
+
+window.renderPhoto = async (opts) => {
+  const { scene, width, height } = opts;
+  const P = params(opts);
+  // With dispersion each sample traces 1 channel, so each channel needs the same count.
+  const samples = P.u.uDisp > 0 ? Math.ceil(opts.samples / 3) * 3 : opts.samples;
+  const { prog, post } = program(scene);
+  canvas.width = 16; canvas.height = 16;
+  const accum = texture(width, height, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT);
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, accum, 0);
+  gl.viewport(0, 0, width, height);
+  gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+
+  gl.useProgram(prog);
+  const u = n => gl.getUniformLocation(prog, n);
+  gl.uniform2f(u('uRes'), width, height);
+  for (const [k, v] of Object.entries(P.u)) {
+    const loc = u(k);
+    if (loc === null || (Array.isArray(v) && v.length === 0)) continue;
+    if (P.ints.has(k)) gl.uniform1i(loc, v);
+    else if (typeof v === 'number') gl.uniform1f(loc, v);
+    else if (v.length === 2) gl.uniform2fv(loc, v);
+    else if (v.length === 3) gl.uniform3fv(loc, v);
+    else if (v.length === 4 && !P.arrays.has(k)) gl.uniform4fv(loc, v);
+    else if (P.arrays.has(k) && P.arrays.get(k) === 3) gl.uniform3fv(loc, new Float32Array(v));
+    else gl.uniform4fv(loc, new Float32Array(v));
+  }
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, logoTexture); gl.uniform1i(u('uLogo'), 1);
+  gl.activeTexture(gl.TEXTURE0);
+  if (logoInfo) gl.uniform4f(u('uLogoInfo'), logoInfo.w, logoInfo.h, logoInfo.scale, logoInfo.pad);
+
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+  gl.enable(gl.SCISSOR_TEST);
+  // Small tiles keep each draw call short. A long draw blocks the desktop
+  // compositor, and the kernel driver then resets the GPU.
+  const TILE = opts.tile || +(window.TILE_OVERRIDE || 128);
+  const probe = new Float32Array(4);
+  for (let s = 0; s < samples; s++) {
+    const jx = halton(s + 1, 2) - .5, jy = halton(s + 1, 3) - .5;
+    const a = halton(s + 1, 5) * Math.PI * 2, r = Math.sqrt(halton(s + 1, 7));
+    gl.uniform2f(u('uJitter'), jx, jy);
+    gl.uniform2f(u('uLens'), Math.cos(a) * r, Math.sin(a) * r);
+    gl.uniform1f(u('uSeed'), s * 17.31);
+    gl.uniform1f(u('uChan'), s % 3);
+    let batch = 0;
+    for (let y = 0; y < height; y += TILE) for (let x = 0; x < width; x += TILE) {
+      gl.scissor(x, y, Math.min(TILE, width - x), Math.min(TILE, height - y));
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      // Reading 1 pixel waits for the GPU, so the driver gets many short jobs.
+      // gl.finish() alone lets the draws pile up into one job, and the kernel
+      // resets the GPU when a job runs longer than 5 seconds.
+      if (++batch % (opts.batch || +(window.BATCH_OVERRIDE || 6)) === 0) gl.readPixels(x, y, 1, 1, gl.RGBA, gl.FLOAT, probe);
+    }
+    if (gl.isContextLost()) throw new Error(`The GPU context was lost at sample ${s + 1}`);
+    await new Promise(res => setTimeout(res, 0));
+  }
+  gl.disable(gl.BLEND); gl.disable(gl.SCISSOR_TEST);
+
+  // Post pass into an 8-bit target, then read back in strips.
+  const out = texture(width, height, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE);
+  const fbo2 = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo2);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, out, 0);
+  gl.useProgram(post);
+  const pu = n => gl.getUniformLocation(post, n);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, accum); gl.uniform1i(pu('uAccum'), 0);
+  // Dispersion traces 1 of 3 channels in each sample, and the channel weight
+  // of 3 brings the sum back to the full value.
+  gl.uniform1f(pu('uSamples'), samples); gl.uniform1f(pu('uDay'), P.u.uDay); gl.uniform1f(pu('uSeed'), P.u.uIndex * 3.7);
+  gl.uniform1f(pu('uMask'), P.u.uMask || 0);
+  gl.uniform2f(pu('uRes'), width, height);
+  gl.uniform3fv(pu('cShadow'), P.grade.shadow); gl.uniform3fv(pu('cHigh'), P.grade.high);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  const c2 = document.createElement('canvas'); c2.width = width; c2.height = height;
+  const ctx = c2.getContext('2d');
+  const STRIP = 256, buf = new Uint8Array(width * STRIP * 4);
+  for (let y = 0; y < height; y += STRIP) {
+    const h = Math.min(STRIP, height - y);
+    gl.readPixels(0, y, width, h, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+    const img = ctx.createImageData(width, h);
+    for (let row = 0; row < h; row++) img.data.set(buf.subarray(row * width * 4, (row + 1) * width * 4), (h - 1 - row) * width * 4);
+    ctx.putImageData(img, 0, height - y - h);
+  }
+  [accum, out].forEach(t => gl.deleteTexture(t));
+  gl.deleteFramebuffer(fbo); gl.deleteFramebuffer(fbo2);
+  return c2.toDataURL(opts.mime || 'image/jpeg', opts.quality || .9);
+};
+
+// ---------- scene parameters ----------
+
+// The color, the clarity and the lighting of a mineral in its variant.
+function look(t, day) {
+  const c = t.colors;
+  // Alexandrite is green in daylight and red under lamp light.
+  const col = t.slug === 'alexandrite' && day ? t.color2 : t.color;
+  return { col, col2: t.slug === 'alexandrite' ? (day ? t.color : t.color2) : t.color2 };
+}
+
+function params(opts) {
+  const t = opts.theme, c = t.colors, day = c.mode === 'light';
+  const scene = opts.scene === 'glint' || opts.scene === 'macro' ? 'specimen' : opts.scene;
+  const r = rng(t.index * 7919 + (day ? 3 : 0) + scene.length * 101);
+  const accent = lin(c.accent), second = lin(t.second);
+  const { col, col2 } = look(t, day);
+  const warm = [1.0, .86, .7], daylight = [1.0, .98, .95];
+  const MAT = { clear: 0, trans: 1, opaque: 2, metal: 3 };
+  const PAT = { none: 0, banded: 1, mottled: 2, speckled: 3, chatoyant: 4, labradorescent: 5, opal: 6, iridescent: 7, veined: 8, swirl: 9, radial: 10, widmanstatten: 11, adularescent: 12, aventurescent: 13, zoned: 14, web: 15, streaked: 16, sheen: 17 };
+  // Deep colors need less absorption per unit of length, or they look black.
+  const L = lin(col).reduce((a, b) => a + b) / 3;
+  const u = {
+    uDay: day ? 1 : 0, uIndex: t.index, uSoft: day ? 6 : 12, uMask: opts.scene === 'glint' ? 1 : 0,
+    uKeyDir: day ? [-.6, .85, .5] : [-.7, .62, .45],
+    uKeyCol: day ? daylight.map(v => v * 2.3) : warm.map(v => v * 2.6),
+    uFillCol: day ? [.36, .37, .40] : lin(c.background).map(v => v * 1.2 + .012),
+    uRimDir: day ? [.6, .4, -.7] : [.72, .5, -.5],
+    uRimCol: day ? [.5, .5, .52] : accent.map(v => v * .8 + .15),
+    cBg: lin(c.background), cDark: lin(c.darker_background), cAccent: accent, cSecond: second,
+    cCol: lin(col), cCol2: lin(col2), cMtx: lin(t.matrix).map(v => v * .45),
+    cBokeh: [c.accent, t.second, '#ffd8a0', '#ffe9c9', t.ansi[4], t.ansi[12]].flatMap(h => lin(h || '#ffd8a0')),
+    uMat: MAT[t.mat], uPat: PAT[t.pattern] || 0, uHabit: 0, uPiece: 0,
+    uIor: t.ior, uDisp: t.mat === 'clear' ? t.disp * 1.6 : 0, uRough: t.surface.rough, uF0: t.surface.f0, uRound: .012,
+    uSigmaK: t.mat === 'clear' ? (L < .03 ? .22 : L < .15 ? .32 : .55) : 0,
+    uRock: [0, 0, 0, 0], uRockS: [1, 1, 1], uCut: [0, 0, 1, -99], uRest: [0, 0, 0, 1], uPA: [1, 1, 1], uRestH: .5, uPieceK: .42, uLogoK: 1215 / 58, uCove: [0, 7],
+    uPl: [], uPlN: 0, uI: [], uQ: [], uA: [], uIN: 0, uWord: 0, uSlice: 0, uZero: 0, uDbg: +(window.DBG || 0), uBand: { malachite: .9, agate: .3, rhodochrosite: .55 }[t.slug] || .7, uTopY: 6, uBounces: 4, uStria: ['stibnite', 'schorl', 'watermelon-tourmaline', 'kyanite', 'epidote', 'kunzite', 'topaz', 'aragonite'].includes(t.slug) ? 1 : 0, uIrid: { bismuth: 1, bornite: .9, chalcopyrite: .35, covellite: .55 }[t.slug] || 0, uZone: t.slug === 'fluorite' ? 0 : 1,
+  };
+  const ints = new Set(['uPlN', 'uIN', 'uHabit', 'uMat', 'uPat', 'uPiece', 'uZero']);
+  const arrays = new Map([['cBokeh', 3], ['uPl', 4], ['uI', 4], ['uQ', 4], ['uA', 4]]);
+  // Table surfaces, as in the coffee photos: wood and slate at night,
+  // marble, linen and oak in the day.
+  const tableKinds = day ? [2, 3, 4] : [0, 1, 0];
+  let table = tableKinds[t.index % 3];
+  const tables = kind => {
+    if (kind === 0) return [mix(c.darker_background, '#2a1a10', .6), mix(c.background, '#5a3820', .5)];
+    if (kind === 1) return [mix(c.darker_background, '#1c1e20', .55), mix(c.background, '#34363a', .55)];
+    if (kind === 2) return [mix(c.background, '#ffffff', .65), mix(mix(c.muted, '#8a8580', .5), c.accent, .1)];
+    if (kind === 3) return [mix(c.background, '#ffffff', .3), mix(c.background, c.muted, .3)];
+    if (kind === 4) return [mix(c.background, '#d8b88a', .4), mix(c.background, '#ffffff', .45)];
+    if (kind === 5) return [mix(c.darker_background, '#0a0a0c', .5), mix(c.background, '#1a1a1e', .5)];
+    if (kind === 6) return [mix(c.background, '#ffffff', .25), mix(c.background, '#d8d8d8', .3)];
+    return [mix(c.darker_background, '#050506', .7), mix(c.darker_background, '#101014', .6)];
+  };
+  const look3 = (pos, target, focal, aperture) => ({ pos, target, focal, aperture, focus: Math.hypot(...pos.map((v, i) => v - target[i])) });
+  let cam = { pos: [0, 2.4, 9.5], target: [0, .2, 0], focal: 2.2, aperture: .14, focus: 9.3 };
+  const planes = planesFor(t);
+  const setPlanes = list => { u.uPl = list.flat(); u.uPlN = list.length; };
+  setPlanes(planes);
+  const aspect = aspectFor(t);
+
+  if (scene === 'specimen') {
+    table = day ? 6 : 5;
+    u.uCove = [16, 7];
+    const sp = specimen(t, r, u, planes, aspect, day);
+    const baked = stretch(sp.planes || planes, sp.bake || aspect);
+    setPlanes(baked);
+    // A crystal's bounding radius goes to A.x, so the shader skips far crystals.
+    const br = Math.max(...vertices(baked, [1, 1, 1]).map(v => Math.hypot(...v))) + .03;
+    for (let i = 0; i < sp.uIN; i++) if (sp.uA[i * 4 + 3] === 0) sp.uA[i * 4] = br;
+    delete sp.planes; delete sp.bake;
+    Object.assign(u, sp);
+    if (u.uDisp > 0) u.uDisp = t.disp * 1.2;
+    // Frame the specimen: it fills about 60 percent of the height and sits a
+    // little right of the middle, where windows cover it least.
+    const ex = extents(u), f = 2.3;
+    const H = Math.max(ex.maxY, 1.5), Wd = ex.maxX - ex.minX, cx = (ex.minX + ex.maxX) / 2;
+    const d = Math.min(15, Math.max(6.5, H * f / (2 * .58), Wd * f / (2 * 1.78 * .5)));
+    const FW = 2 * 1.78 * d / f;
+    const target = [cx - .12 * FW, H * .46, ex.cz];
+    const dir = unit([.1, .2, 1]);
+    const pos = target.map((v, i) => v + dir[i] * d);
+    const center = [cx, H * .45, ex.cz];
+    const ww = unit(target.map((v, i) => v - pos[i]));
+    cam = { pos, target, focal: f, aperture: day ? .09 : .11, focus: center.reduce((a, v, i) => a + (v - pos[i]) * ww[i], 0) };
+    // The glint mask needs sharp highlights.
+    if (opts.scene === 'glint') cam.aperture = 0;
+    // The close-up: the camera moves in on the largest crystal, with a short focus.
+    if (opts.scene === 'macro') {
+      const fc = ex.hero;
+      const tgt = [fc[0], fc[1], fc[2]];
+      const md = Math.max(3.2, ex.heroR * 3.4);
+      const mpos = [tgt[0] - md * .32, tgt[1] + md * .3, tgt[2] + md * .9];
+      cam = look3(mpos, [tgt[0] - md * .16, tgt[1] - md * .04, tgt[2]], 2.4, .18);
+    }
+  } else if (scene === 'wordmark' || scene === 'rough') {
+    Object.assign(u, pieceFor(t, planes, aspect));
+    u.uSigmaK *= scene === 'wordmark' ? 2.6 : 1.6;
+    setPlanes(stretch(planes, u.uPA));
+    if (scene === 'wordmark') {
+      u.uWord = 1;
+      cam = look3([0, 30, 23], [0, 0, 1.2], 2.15, .3);
+      u.uKeyDir = day ? [-.55, .85, .45] : [-.8, .55, -.25];
+    } else {
+      u.uPieceK *= 1.05;
+      // Rough pieces: broken chunks instead of tumbled stones
+      if (u.uPiece === 1) { u.uPiece = 2; u.uRestH = .42; }
+      cam = look3([0, 2.9 + r() * .5, 8.6], [(r() - .5) * 1.5, .1, 0], 2.4, .16);
+      if (day) { u.uKeyDir = [-.5, 1.0, .35]; table = 4; }
+    }
+  } else if (scene === 'gem') {
+    table = day ? 6 : 7;
+    const cut = t.slug === 'emerald' || t.slug === 'aquamarine' || t.slug === 'morganite' || t.slug === 'kunzite' ? 'step' : 'brilliant';
+    const oval = ['ruby', 'sapphire', 'peridot', 'tanzanite', 'alexandrite', 'spinel'].includes(t.slug);
+    const a = oval ? [1.25, 1, .92] : cut === 'step' ? [1.15, 1, 1] : [1, 1, 1];
+    setPlanes(stretch(gemPlanes(cut), a));
+    // The main gem leans on the side of its pavilion with the table toward the
+    // camera. The second gem lies table down behind it. Each one rests with its
+    // lowest corner on the table.
+    const gv = vertices(gemPlanes(cut), a);
+    const restY = (q, s) => -Math.min(...gv.map(v => qApply(q, v)[1])) * s;
+    const q1 = qMul(qAxisJS([0, 1, 0], -.35 + r() * .5), qAxisJS([1, 0, 0], .62));
+    const q2 = qMul(qAxisJS([0, 1, 0], 2.1), qAxisJS([1, 0, 0], Math.PI - .25));
+    const s1 = 1.75, s2 = 1.1;
+    u.uI = [1.5, restY(q1, s1), .3, s1, -2.6, restY(q2, s2), -4.0, s2];
+    u.uQ = [...q1, ...q2];
+    u.uA = [...a, 0, ...a, 0];
+    u.uIN = 2;
+    u.uSigmaK *= 1.4;
+    u.uDisp = t.disp * 1.8;
+    cam = look3([-.6, 3.9, 7.0], [.75, .75, -.2], 2.4, .12);
+    u.uKeyDir = day ? [-.5, .9, .4] : [-.55, .75, .35];
+  } else if (scene === 'slab') {
+    cam = look3([0, 3.8, 5.0], [0, 0, -1.2], 2.5, .1);
+    u.uKeyCol = u.uKeyCol.map(v => v * .85);
+    u.uKeyDir = day ? [-.35, .8, -.5] : [-.25, .55, -.8];
+    if (t.slug === 'fluorite') { u.uPat = 1; u.uBand = .35; }
+    if (t.slug === 'watermelon-tourmaline') { u.uSlice = 1; table = day ? 6 : 1; cam = look3([0, 6.2, 4.6], [.5, 0, -1.2], 2.4, .08); }
+  }
+  // The highest point of the scene, so a shadow ray can stop above it.
+  if (scene === 'specimen') { const ex = extents(u); u.uTopY = ex.maxY + .3; }
+  else if (scene === 'wordmark' || scene === 'rough') { u.uTopY = 1.6; u.uBounces = 2; }
+  else if (scene === 'gem') u.uTopY = 4.5;
+  let [tableA, tableB] = tables(table);
+  // Pale pieces vanish on a white table in the day, so they get a gray one.
+  const lum = lin(col).reduce((a, v, i) => a + v * [.2126, .7152, .0722][i], 0);
+  if (day && (scene === 'wordmark' || scene === 'rough') && lum > .3) { tableA = mix(tableA, '#5e5a55', .72); tableB = mix(tableB, '#6e6962', .72); }
+  u.uTable = table; u.cTableA = lin(tableA); u.cTableB = lin(tableB);
+  u.uCamPos = cam.pos; u.uCamTarget = cam.target; u.uFocal = cam.focal; u.uAperture = cam.aperture; u.uFocus = cam.focus;
+  return { u, ints, arrays, grade: { shadow: lin(mix(c.darker_background, '#808080', .5)), high: lin(mix(c.accent, '#ffffff', .7)) } };
+}
+
+// The box around the specimen, from the corners of every crystal and the
+// size of the rock or the body. hero is the middle of the largest crystal.
+function extents(u) {
+  const pts = [];
+  const planes = [];
+  for (let k = 0; k < u.uPlN; k++) planes.push(u.uPl.slice(k * 4, k * 4 + 4));
+  const verts = u.uPlN ? vertices(planes, [1, 1, 1]) : [];
+  let hero = null, heroR = 0;
+  for (let i = 0; i < u.uIN; i++) {
+    const I = u.uI.slice(i * 4, i * 4 + 4), Q = u.uQ.slice(i * 4, i * 4 + 4), A = u.uA.slice(i * 4, i * 4 + 4);
+    const at = v => { const w = qApply(Q, v); return [I[0] + w[0] * I[3], I[1] + w[1] * I[3], I[2] + w[2] * I[3]]; };
+    let local = [];
+    if (A[3] === 0) local = verts.map(at);
+    else if (A[3] === 1) local = [at([0, 0, 0]), at([0, A[1], 0])];
+    else { const r = (A[3] === 3 ? 1.2 : A[0]) * I[3]; local = [[I[0] - r, I[1] - r, I[2]], [I[0] + r, I[1] + r, I[2]]]; }
+    pts.push(...local);
+    const c = local.reduce((a, p) => a.map((v, k) => v + p[k] / local.length), [0, 0, 0]);
+    const rr = Math.max(...local.map(p => Math.hypot(p[0] - c[0], p[1] - c[1], p[2] - c[2])));
+    if (rr > heroR) { heroR = rr; hero = c; }
+  }
+  const R = u.uRock, S = u.uRockS;
+  if (R[3] > 0 || [2, 3, 4, 5, 6].includes(u.uHabit)) {
+    const s = u.uHabit === 3 ? [R[3], R[3], R[3]] : S;
+    pts.push([R[0] - s[0], R[1] + s[1], R[2]], [R[0] + s[0], R[1] + s[1], R[2]]);
+    if (!hero) { hero = [R[0], R[1] + s[1] * .4, R[2]]; heroR = Math.max(...s) * .7; }
+  }
+  if (!pts.length) pts.push([-1, 0, 0], [1, 2, 0]);
+  const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]), zs = pts.map(p => p[2]);
+  return { minX: Math.min(...xs), maxX: Math.max(...xs), maxY: Math.max(...ys), cz: (Math.min(...zs) + Math.max(...zs)) / 2, hero: hero || [0, 1, 0], heroR: heroR || 1 };
+}
+
+// ---------- the specimen ----------
+
+// Builds the instances of the specimen: crystals on a host rock, a massive
+// stone, balls, branches or a geode. Sizes are in the units of the scene,
+// where the specimen is about 4 units wide.
+function specimen(t, r, u, planes, aspect, day) {
+  const out = { uI: [], uQ: [], uA: [], uIN: 0, uHabit: 0, uRock: [0, .85, 0, 1], uRockS: [2.3, .85, 1.7] };
+  const add = (pos, q, s, a, type = 0) => {
+    if (out.uIN >= 24) return;
+    out.uI.push(...pos, s); out.uQ.push(...q); out.uA.push(...a, type); out.uIN++;
+  };
+  const rockTop = (x, z) => out.uRock[1] + out.uRockS[1] * Math.sqrt(Math.max(0, 1 - (x / out.uRockS[0]) ** 2 - (z / out.uRockS[2]) ** 2)) * .8;
+  // Crystals that grow up and out of the rock, larger in the middle.
+  const cluster = (n, size, spread, lean, opts = {}) => {
+    for (let i = 0; i < n; i++) {
+      const a = r() * Math.PI * 2, d = Math.sqrt(r()) * spread * (i === 0 ? .15 : 1);
+      const x = Math.cos(a) * d * out.uRockS[0] * .7, z = Math.sin(a) * d * out.uRockS[2] * .55;
+      const dir = unit([x * lean + (r() - .5) * .5, 1.6, z * lean + (r() - .5) * .5 + .15]);
+      const s = size * (i === 0 ? 1.25 : .55 + r() * .55);
+      const base = [x, rockTop(x, z) - .25 * s, z];
+      const q = qMul(qFromYJS(dir), qAxisJS([0, 1, 0], r() * Math.PI));
+      add(base, q, s, opts.aspect || aspect, opts.type || 0);
+    }
+  };
+  const h = t.habit, s = t.slug;
+  if (['prism6', 'beryl', 'barrel', 'prism3', 'prism4', 'blades', 'prism', 'scalenohedron', 'dipyramid', 'wedge', 'rhombohedron'].includes(h)) {
+    const n = { beryl: 6, barrel: 7, prism3: 6, blades: 9, wedge: 5, dipyramid: 7, rhombohedron: 9, scalenohedron: 8, prism: 7 }[h] || 9;
+    cluster(n, h === 'blades' ? 1.15 : 1.0, .95, h === 'blades' || h === 'scalenohedron' ? .45 : .3);
+    if (s === 'morganite' || s === 'cinnabar' || s === 'ruby') { out.uRockS = [2.4, .8, 1.8]; }
+  } else if (['cube', 'octahedron', 'dodecahedron', 'tetrahedron', 'tabular'].includes(h)) {
+    // Equant crystals sit on the rock in random turns.
+    const n = h === 'tabular' ? 8 : 9;
+    for (let i = 0; i < n; i++) {
+      const a = r() * Math.PI * 2, d = Math.sqrt(r()) * (i === 0 ? .1 : .9);
+      const x = Math.cos(a) * d * out.uRockS[0] * .75, z = Math.sin(a) * d * out.uRockS[2] * .6;
+      const sz = (h === 'tabular' ? .95 : 1.0) * (i === 0 ? 1.35 : .5 + r() * .6);
+      let q = qMul(qAxisJS(unit([r() - .5, r() - .5, r() - .5]), r() * 6.28), qAxisJS([0, 1, 0], r() * 6.28));
+      // Plates stand up at an angle, like wulfenite on its matrix.
+      if (h === 'tabular') q = qMul(qAxisJS([0, 1, 0], r() * 6.28), qAxisJS([1, 0, 0], 1.0 + (r() - .5) * .9));
+      add([x, rockTop(x, z) + sz * (h === 'tabular' ? .25 : .1), z], q, sz, aspect);
+    }
+  } else if (h === 'sixling') {
+    out.bake = [1, 1, 1];
+    // Three plates that cross at 60 degrees, standing on the rock
+    for (let k = 0; k < 2; k++) {
+      const x = k === 0 ? .2 : -1.5, z = k === 0 ? .3 : -.6, sz = k === 0 ? 1.7 : 1.0;
+      const tilt = qMul(qAxisJS([0, 1, 0], r() * 6.28), qAxisJS([1, 0, 0], (r() - .5) * .5));
+      for (let i = 0; i < 3; i++) add([x, rockTop(x, z) + sz * .45, z], qMul(tilt, qAxisJS([0, 1, 0], i * Math.PI / 3)), sz, [1, 1, 1]);
+    }
+  } else if (h === 'cross') {
+    // Staurolite: two prisms that cross at right angles
+    out.uRock = [0, .5, 0, 1]; out.uRockS = [2.6, .5, 2.0];
+    const base = qMul(qAxisJS([0, 1, 0], .5), qAxisJS([1, 0, 0], -.35));
+    add([0, 1.9, 0], qMul(base, qAxisJS([0, 0, 1], .0)), 1.25, [1, 1.9, 1]);
+    add([0, 1.9, 0], qMul(base, qAxisJS([0, 0, 1], Math.PI / 3)), 1.25, [1, 1.9, 1]);
+    // The ends of a prism are flat, so the planes get flat caps.
+    out.planes = [...ring(2, 35, 0, .5), ...ring(2, 145, 0, .5), pl([0, 0, 1], .38), pl([0, 0, -1], .38), pl([0, 1, 0], .9), pl([0, -1, 0], .9)];
+    out.bake = [1, 1.9, 1];
+  } else if (h === 'acicular' || h === 'star') {
+    if (s === 'cavansite') {
+      // Balls of blue needles on a pale matrix
+      for (let i = 0; i < 6; i++) {
+        const a = r() * 6.28, d = Math.sqrt(r()) * (i === 0 ? .1 : .85);
+        const x = Math.cos(a) * d * 2.0, z = Math.sin(a) * d * 1.3, sz = i === 0 ? .85 : .35 + r() * .35;
+        add([x, rockTop(x, z) + sz * .3, z], [0, 0, 0, 1], sz, [1, 1, 1], 4);
+      }
+    } else if (h === 'star') {
+      // Rutile on hematite: golden needles that radiate in six directions
+      out.uRock = [0, .35, 0, 1]; out.uRockS = [2.8, .35, 2.1];
+      u.cMtx = lin(t.matrix);
+      for (let i = 0; i < 18; i++) {
+        const a = (i % 6) * Math.PI / 3 + (i >= 6 ? .5 + r() * .3 : r() * .08), len = i < 6 ? 2.1 + r() * .5 : 1.0 + r() * .8;
+        const c0 = i < 12 ? [0, .78, 0] : [(r() - .5) * 2.5, .72, (r() - .5) * 1.6];
+        const dir = [Math.cos(a), .02, Math.sin(a)];
+        add(c0, qFromYJS(dir), 1, [.075 + r() * .03, len * 1.15, 1], 1);
+      }
+    } else {
+      // Sprays of needles that grow from a few points of the rock
+      out.bake = s === 'erythrite' ? [.07, 1.7, .03] : s === 'crocoite' ? [.11, 1.5, .11] : [.09, 1.8, .09];
+      const centers = s === 'crocoite' ? [[.3, .1], [-1.1, -.3]] : [[.2, .1], [-1.3, -.4], [1.3, -.3]];
+      const per = Math.floor(24 / centers.length);
+      for (const [cx, cz] of centers) {
+        const base = [cx, rockTop(cx, cz) - .2, cz];
+        for (let i = 0; i < per; i++) {
+          const dir = unit([(r() - .5) * 1.3 + cx * .25, 1.0, (r() - .5) * 1.1 + .2]);
+          const len = (s === 'crocoite' ? 1.25 : 1.0) * (.6 + r() * .55);
+          add(base, qMul(qFromYJS(dir), qAxisJS([0, 1, 0], r() * 6.28)), len, out.bake);
+        }
+      }
+    }
+  } else if (h === 'books') {
+    out.bake = [1, 1, 1];
+    // Stacks of thin plates, slightly offset like the pages of a book
+    const books = s === 'muscovite' ? [[0, 0, 1.25, 9]] : [[.3, .2, .95, 7], [-1.3, -.3, .7, 6], [1.4, -.5, .55, 5]];
+    for (const [bx, bz, bs, n] of books) {
+      const tilt = qMul(qAxisJS([0, 1, 0], r() * 6.28), qAxisJS(unit([r() - .5, 0, r() - .5]), s === 'muscovite' ? .25 : .35 + r() * .5));
+      const up = qApply(tilt, [0, 1, 0]);
+      for (let i = 0; i < n; i++) {
+        const off = i * bs * .12, jit = (r() - .5) * .06 * bs;
+        // Muscovite stands alone on the floor; the other books sit on their rock.
+        const y0 = s === 'muscovite' ? bs * .35 : rockTop(bx, bz) + .05;
+        const pos = [bx + up[0] * off + jit, y0 + up[1] * off, bz + up[2] * off + jit];
+        add(pos, qMul(tilt, qAxisJS([0, 1, 0], (r() - .5) * .12)), bs * (1 - i * .02), [1, 1, 1]);
+      }
+    }
+    if (s === 'muscovite') out.uRock = [0, 0, 0, 0];
+  } else if (h === 'botryoidal') {
+    // Smooth balls of many sizes that melt together
+    out.uHabit = 1;
+    out.uRock = [0, 1.2, 0, 0];
+    for (let i = 0; i < 18; i++) {
+      const a = r() * 6.28, d = Math.sqrt(r());
+      const x = Math.cos(a) * d * 2.2, z = Math.sin(a) * d * 1.5, sz = .55 + r() * .65;
+      add([x, .9 + sz * .5 + (1 - d) * .7, z], [0, 0, 0, 1], sz, [1, 1, 1], 2);
+    }
+    // Malachite shows a polished cut through its bands.
+    if (s === 'malachite') out.uCut = [...unit([.25, .35, 1]), .6];
+  } else if (h === 'massive') {
+    out.uHabit = 2;
+    out.uRock = [0, 1.55, 0, 1]; out.uRockS = [2.6, 1.55, 1.9];
+    out.uCut = [...unit([.12, .55, .85]), .95];
+  } else if (h === 'geode') {
+    out.uHabit = 3;
+    out.uRock = [0, 2.5, -.3, 2.8]; out.uRockS = [1, 1, 1];
+    out.uCut = [...unit([.38, .32, 1]), .15];
+    out.uPA = s === 'celestine' ? [1, .9, 1] : [1, 1.2, 1];
+    out.bake = out.uPA;
+  } else if (h === 'druse') {
+    out.uHabit = 4;
+    out.uRock = [0, .2, 0, 1]; out.uRockS = [2.5, 1.0, 1.9];
+    out.bake = [1, 1, 1];
+  } else if (h === 'nugget') {
+    out.uHabit = 5;
+    out.uRock = [0, 1.0, 0, 1]; out.uRockS = [1.9, 1.0, 1.35];
+  } else if (h === 'meteorite') {
+    out.uHabit = 6;
+    out.uRock = [0, 1.5, 0, 1]; out.uRockS = [2.7, 1.5, 1.9];
+    out.uCut = [...unit([.15, .3, 1]), .7];
+  } else if (h === 'dendrite') {
+    // Branches of copper, or curled wires of silver
+    out.uHabit = 7;
+    out.uRock = [0, .45, 0, 1]; out.uRockS = [2.2, .5, 1.6];
+    const wire = s === 'silver';
+    const grow = (p, dir, len, rad, depth) => {
+      if (out.uIN >= 24 || depth > 3) return;
+      const segs = wire ? 4 : 1;
+      let pos = p, d = dir;
+      for (let k = 0; k < segs && out.uIN < 24; k++) {
+        add(pos, qFromYJS(d), 1, [rad, len / segs, 1], 1);
+        pos = pos.map((v, i) => v + d[i] * len / segs);
+        if (wire) d = unit([d[0] + (r() - .5) * .9, d[1] + (r() - .5) * .3, d[2] + (r() - .5) * .9]);
+      }
+      if (wire) return;
+      const kids = depth === 0 ? 4 : 2;
+      for (let k = 0; k < kids; k++) {
+        const f = .35 + .6 * (k + r() * .5) / kids;
+        const bp = p.map((v, i) => v + dir[i] * len * f);
+        const nd = unit([dir[0] + (r() - .5) * 1.6, dir[1] * .7 + .2, dir[2] + (r() - .5) * 1.6]);
+        grow(bp, nd, len * .55, rad * .7, depth + 1);
+      }
+    };
+    if (wire) for (let i = 0; i < 6; i++) grow([(r() - .5) * 1.8, .7, (r() - .5) * 1.0], unit([(r() - .5) * .8, 1, (r() - .5) * .6]), 1.5 + r() * 1.3, .12, 0);
+    else {
+      // Three stems in a fan, each with short side branches on both sides
+      for (let k = 0; k < 3; k++) {
+        const base = [(k - 1) * .5, .6, 0], dir = unit([(k - 1) * .55, 1, (r() - .5) * .2]);
+        const len = 2.6 - Math.abs(k - 1) * .5;
+        add(base, qFromYJS(dir), 1, [.17, len, 1], 1);
+        for (let j = 0; j < 6 && out.uIN < 24; j++) {
+          const f = .2 + j * .13, side = j % 2 ? 1 : -1;
+          const bp = base.map((v, i) => v + dir[i] * len * f);
+          const bd = unit([dir[0] + side * .9, dir[1] * .6, dir[2] + (r() - .5) * .3]);
+          add(bp, qFromYJS(bd), 1, [.1, len * (.42 - j * .04), 1], 1);
+        }
+      }
+    }
+  } else if (h === 'hopper') {
+    // Bismuth: hopper crystals that step up and out
+    for (let i = 0; i < 5; i++) {
+      const x = [0, -1.5, 1.4, -.4, .9][i], z = [0, -.4, -.5, -1.3, .9][i], y = [.55, .35, .3, .9, .2][i], sz = [1.45, 1.0, .9, .85, .7][i];
+      add([x, y, z], qMul(qAxisJS([0, 1, 0], r() * 6.28), qAxisJS(unit([r() - .5, 0, r() - .5]), .5 + r() * .5)), sz, [1.1, 1.1, 1.1], 3);
+    }
+    out.uRock = [0, 0, 0, 0];
+  }
+  return out;
+}
+
+// The shape of a single piece for the wordmark and the rough scenes, how it
+// rests on the table, and the radius of a sphere around it (uPieceR).
+function pieceFor(t, planes, aspect) {
+  const out = pieceShape(t, planes, aspect);
+  if (out.uPiece === 0 || out.uPiece === 6 || out.uPiece === 7) {
+    const v = vertices(planes, out.uPA);
+    const r = Math.max(...v.map(p => Math.hypot(...p)));
+    out.uPieceR = (out.uPiece === 6 ? r : r) + .05;
+  } else out.uPieceR = { 1: 1.05, 2: 1.0, 3: 1.25, 4: 1.15, 5: 1.1 }[out.uPiece];
+  return out;
+}
+function pieceShape(t, planes, aspect) {
+  const h = t.habit, s = t.slug;
+  const out = { uPiece: 0, uPA: aspect, uPieceK: .58 };
+  if (['massive', 'botryoidal', 'meteorite'].includes(h)) { out.uPiece = 1; out.uRestH = .55; out.uRest = [0, 0, 0, 1]; out.uPieceK = .5; return out; }
+  if (h === 'nugget' || h === 'dendrite') { out.uPiece = 3; out.uRestH = .5; out.uRest = [0, 0, 0, 1]; out.uPieceK = .46; return out; }
+  if (s === 'cavansite') { out.uPiece = 4; out.uRestH = .7; out.uRest = [0, 0, 0, 1]; out.uPieceK = .45; return out; }
+  if (h === 'hopper') { out.uPiece = 5; out.uRestH = .1; out.uRest = [0, 0, 0, 1]; out.uPieceK = .55; return out; }
+  if (h === 'cross') { out.uPiece = 6; out.uPA = [1, 1.9, 1]; out.uRest = qAxisJS([1, 0, 0], Math.PI / 2); out.uRestH = .42; out.uPieceK = .4; return out; }
+  if (h === 'sixling') { out.uPiece = 7; out.uPA = [1, 1, 1]; out.uRest = [0, 0, 0, 1]; out.uRestH = .62; out.uPieceK = .5; return out; }
+  // A crystal: find the face that points down when it lies on its side, and
+  // the height of its middle above the table.
+  let a = aspect.slice();
+  if (['acicular', 'star'].includes(h)) a = [.14, 1.6, .14];
+  if (h === 'books') a = [.6, 1, .6];
+  if (h === 'druse') a = [1, 1, 1];
+  out.uPA = a;
+  // Long crystals lie on a side face. Equant ones rest on any face.
+  const long = a[1] > 1.3 || ['prism6', 'beryl', 'prism3', 'prism4', 'blades', 'prism', 'scalenohedron', 'acicular', 'star', 'geode'].includes(h);
+  let rest = [0, 0, 0, 1];
+  if (long) rest = qAxisJS([0, 0, 1], Math.PI / 2);
+  if (h === 'books' || h === 'tabular') rest = [0, 0, 0, 1];
+  // The rest height: the lowest point of the shape after the turn, from the planes.
+  const verts = vertices(planes, a);
+  let minY = 0;
+  for (const v of verts) minY = Math.min(minY, qApply(rest, v)[1]);
+  out.uRest = rest; out.uRestH = -minY * .98;
+  if (['acicular', 'star'].includes(h)) out.uPieceK = .5;
+  if (h === 'books') out.uPieceK = .5;
+  return out;
+}
+
+</script>
+</body>
+</html>

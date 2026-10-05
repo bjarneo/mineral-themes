@@ -1,0 +1,349 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Mineral card renderer</title>
+<style>html,body{margin:0;background:#000}canvas{display:block}</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script src="crystals.js"></script>
+<script>
+// The data card of each mineral: a flat drawing with the name, the formula, a
+// line drawing of the crystal, the Mohs scale, the luster, the streak, the
+// density and a locality. tools/render.mjs loads this page in headless
+// Chromium and calls window.renderImage() for each image.
+// All drawing uses a 3840x2160 design space. S scales the design space to
+// the output size, so every size looks the same.
+
+const W = 3840, H = 2160;
+const MONO = '"JetBrainsMono Nerd Font", "JetBrains Mono", monospace';
+const SERIF = '"Noto Serif", serif';
+let S = 1;
+
+// ---------- helpers ----------
+
+function rng(seed) {
+  return () => {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function rgb(hex) { return [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16)); }
+function rgba(hex, a) { const [r, g, b] = rgb(hex); return `rgba(${r},${g},${b},${a})`; }
+function mix(a, b, t) {
+  const pa = rgb(a), pb = rgb(b);
+  return '#' + pa.map((v, i) => Math.round(v * (1 - t) + pb[i] * t).toString(16).padStart(2, '0')).join('');
+}
+function lerp(a, b, t) { return a + (b - a) * t; }
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+// Seeded 2D gradient noise.
+function makeNoise(seed) {
+  const r = rng(seed), perm = new Uint8Array(512), grad = [];
+  const p = [...Array(256).keys()];
+  for (let i = 255; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [p[i], p[j]] = [p[j], p[i]]; }
+  for (let i = 0; i < 512; i++) perm[i] = p[i & 255];
+  for (let i = 0; i < 256; i++) { const a = r() * Math.PI * 2; grad.push([Math.cos(a), Math.sin(a)]); }
+  const fade = t => t * t * t * (t * (t * 6 - 15) + 10);
+  function n(x, y) {
+    const x0 = Math.floor(x), y0 = Math.floor(y), sx = fade(x - x0), sy = fade(y - y0);
+    const X = x0 & 255, Y = y0 & 255, fx = x - x0, fy = y - y0;
+    const d = (dx, dy) => { const g = grad[perm[((X + dx) & 255) + perm[(Y + dy) & 255]]]; return g[0] * (fx - dx) + g[1] * (fy - dy); };
+    return lerp(lerp(d(0, 0), d(1, 0), sx), lerp(d(0, 1), d(1, 1), sx), sy);
+  }
+  n.fbm = (x, y, oct = 5) => { let s = 0, a = .5, f = 1; for (let i = 0; i < oct; i++) { s += a * n(x * f, y * f); a *= .5; f *= 2; } return s; };
+  return n;
+}
+
+// Fills the design space from a per-pixel function at a lower resolution.
+function pixels(ctx, fn, width = 1600) {
+  const tw = Math.min(width, Math.round(W * S)), th = Math.round(tw * H / W);
+  const cv = document.createElement('canvas'); cv.width = tw; cv.height = th;
+  const cx = cv.getContext('2d'), img = cx.createImageData(tw, th), d = img.data;
+  for (let j = 0, i = 0; j < th; j++) {
+    const y = (j + .5) * H / th;
+    for (let k = 0; k < tw; k++, i += 4) {
+      const c = fn((k + .5) * W / tw, y);
+      d[i] = c[0]; d[i + 1] = c[1]; d[i + 2] = c[2]; d[i + 3] = 255;
+    }
+  }
+  cx.putImageData(img, 0, 0);
+  ctx.save(); ctx.imageSmoothingQuality = 'high'; ctx.drawImage(cv, 0, 0, W, H); ctx.restore();
+}
+
+function vignette(ctx, P, amount) {
+  const g = ctx.createRadialGradient(W / 2, H / 2, H * .35, W / 2, H / 2, W * .62);
+  const c = P.light ? P.c[8] : P.darker;
+  g.addColorStop(0, rgba(c, 0)); g.addColorStop(1, rgba(c, amount));
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+}
+
+// Fine grain hides gradient banding after JPEG compression.
+function grain(ctx, seed, alpha = .05) {
+  const cv = document.createElement('canvas'); cv.width = cv.height = 256;
+  const gx = cv.getContext('2d'), r = rng(seed), img = gx.createImageData(256, 256);
+  for (let i = 0; i < img.data.length; i += 4) { const v = r() * 255; img.data[i] = img.data[i + 1] = img.data[i + 2] = v; img.data[i + 3] = 255; }
+  gx.putImageData(img, 0, 0);
+  ctx.save();
+  ctx.globalAlpha = alpha; ctx.globalCompositeOperation = 'overlay';
+  const pattern = ctx.createPattern(cv, 'repeat');
+  pattern.setTransform(new DOMMatrix().scale(1 / S));
+  ctx.fillStyle = pattern; ctx.fillRect(0, 0, W, H);
+  ctx.restore();
+}
+
+function text(ctx, str, x, y, size, color, { font = MONO, weight = '', align = 'left', spacing = 0, alpha = 1 } = {}) {
+  ctx.save();
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.fillStyle = color; ctx.textAlign = align; ctx.textBaseline = 'alphabetic'; ctx.globalAlpha = alpha;
+  if (spacing) ctx.letterSpacing = `${spacing}px`;
+  ctx.fillText(str, x, y);
+  const w = ctx.measureText(str).width;
+  ctx.restore();
+  return w;
+}
+
+function wrap(ctx, str, size, width, font = MONO) {
+  ctx.save(); ctx.font = `${size}px ${font}`;
+  const lines = []; let line = '';
+  for (const w of str.split(' ')) { const t = line ? `${line} ${w}` : w; if (ctx.measureText(t).width > width && line) { lines.push(line); line = w; } else line = t; }
+  lines.push(line);
+  ctx.restore();
+  return lines;
+}
+
+// ---------- the card ----------
+
+// Paper in the colors of the theme, with a faint dot grid.
+function paperBase(ctx, P, noise) {
+  ctx.fillStyle = P.bg; ctx.fillRect(0, 0, W, H);
+  pixels(ctx, (x, y) => {
+    const v = noise.fbm(x * .003, y * .003, 3) * .5 + noise(x * .08, y * .08) * .2;
+    return rgb(P.bg).map(ch => ch * (1 + v * (P.light ? .03 : .08)));
+  }, 1400);
+  ctx.fillStyle = rgba(P.c[8], P.light ? .22 : .18);
+  for (let y = 90; y < H; y += 90) for (let x = 90; x < W; x += 90) ctx.fillRect(x - 3, y - 3, 6, 6);
+}
+
+// The left column: the class, the name, the description and the note.
+function titleBlock(ctx, P, x, y) {
+  const label = `${P.category.toUpperCase()}  ·  ${String(P.index).padStart(2, '0')} / ${P.total}`;
+  text(ctx, label, x, y, 40, P.c[8], { spacing: 8 });
+  let size = 230;
+  ctx.save(); ctx.font = `300 ${size}px ${SERIF}`; const w = ctx.measureText(P.base).width; ctx.restore();
+  if (w > 1700) size = Math.floor(size * 1700 / w);
+  text(ctx, P.base, x - 8, y + 40 + size, size, P.fg, { font: SERIF, weight: '300' });
+  ctx.fillStyle = P.accent; ctx.fillRect(x, y + 120 + size, 140, 8);
+  const lines = wrap(ctx, P.desc, 52, 1560);
+  lines.forEach((l, i) => text(ctx, l, x, y + 260 + size + i * 74, 52, P.dfg));
+  let yy = y + 260 + size + lines.length * 74;
+  if (P.note) {
+    yy += 40;
+    ctx.save(); ctx.font = `44px ${MONO}`; const cw = ctx.measureText(P.note).width + 64; ctx.restore();
+    ctx.fillStyle = rgba(P.accent, P.light ? .1 : .12); ctx.beginPath(); ctx.roundRect(x, yy, cw, 86, 43); ctx.fill();
+    ctx.strokeStyle = rgba(P.accent, .55); ctx.lineWidth = 3; ctx.stroke();
+    text(ctx, P.note, x + 32, yy + 58, 44, P.fg);
+    yy += 86;
+  }
+  return yy;
+}
+
+// A chemical formula with the subscript digits drawn small and low.
+function formula(ctx, P, str, x, y, size) {
+  const SUB = '₀₁₂₃₄₅₆₇₈₉', DOTS = '.';
+  let cx = x;
+  for (let i = 0; i < str.length; i++) {
+    const ch = str[i];
+    const sub = SUB.indexOf(ch);
+    if (sub >= 0 || (ch === DOTS && SUB.includes(str[i - 1] || '') && SUB.includes(str[i + 1] || ''))) {
+      cx += text(ctx, sub >= 0 ? String(sub) : '.', cx, y + size * .22, size * .6, P.accent, { font: SERIF });
+    } else {
+      cx += text(ctx, ch, cx, y, size, P.fg, { font: SERIF });
+    }
+  }
+  return cx - x;
+}
+
+// A label over a value, as in the data rows.
+function cell(ctx, P, x, y, label, value, width) {
+  text(ctx, label.toUpperCase(), x, y, 34, P.c[8], { spacing: 6 });
+  const lines = wrap(ctx, value, 50, width);
+  lines.slice(0, 2).forEach((l, i) => text(ctx, l, x, y + 74 + i * 64, 50, P.fg));
+}
+
+// The Mohs scale: 10 marks with the reference minerals, and the range of this
+// mineral as a bar in the accent color.
+const MOHS = ['Talc', 'Gypsum', 'Calcite', 'Fluorite', 'Apatite', 'Orthoclase', 'Quartz', 'Topaz', 'Corundum', 'Diamond'];
+function mohs(ctx, P, x, y, width) {
+  text(ctx, 'MOHS HARDNESS', x, y, 34, P.c[8], { spacing: 6 });
+  const [lo, hi] = P.hardness;
+  text(ctx, lo === hi ? String(lo) : `${lo} to ${hi}`, x + width, y, 50, P.fg, { align: 'right' });
+  const ty = y + 70, X = v => x + (v - 1) / 9 * width;
+  ctx.strokeStyle = rgba(P.fg, .35); ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.moveTo(x, ty); ctx.lineTo(x + width, ty); ctx.stroke();
+  for (let i = 1; i <= 10; i++) {
+    ctx.fillStyle = rgba(P.fg, .6); ctx.fillRect(X(i) - 2, ty - 14, 4, 28);
+    text(ctx, String(i), X(i), ty + 66, 36, P.dfg, { align: 'center' });
+    ctx.save(); ctx.translate(X(i), ty + 96); ctx.rotate(Math.PI / 4);
+    text(ctx, MOHS[i - 1], 0, 0, 28, P.c[8]);
+    ctx.restore();
+  }
+  ctx.fillStyle = P.accent;
+  ctx.beginPath(); ctx.roundRect(X(lo) - 18, ty - 18, Math.max(36, X(hi) - X(lo) + 36), 36, 18); ctx.fill();
+}
+
+// The streak: the color of the powder on a plate of unglazed porcelain.
+function streak(ctx, P, x, y, r) {
+  text(ctx, 'STREAK', x, y, 34, P.c[8], { spacing: 6 });
+  const [words, hex] = P.streak;
+  const py = y + 40;
+  // Unglazed porcelain, a little gray so that a white streak still shows
+  ctx.fillStyle = '#cfcbc2';
+  ctx.beginPath(); ctx.roundRect(x, py, 330, 120, 18); ctx.fill();
+  // A brush stroke of powder: dense in the middle, broken at the ends
+  for (let i = 0; i < 260; i++) {
+    const t = r(), sx = x + 40 + t * 250, sy = py + 60 + (r() - .5) * 46 * Math.sin(t * Math.PI);
+    ctx.fillStyle = rgba(hex, .3 + .6 * Math.sin(t * Math.PI));
+    ctx.beginPath(); ctx.ellipse(sx, sy, 10 + r() * 14, 4 + r() * 6, -.15, 0, Math.PI * 2); ctx.fill();
+  }
+  const lines = wrap(ctx, words, 46, 620);
+  lines.slice(0, 2).forEach((l, i) => text(ctx, l, x + 370, py + 58 + i * 58, 46, P.fg));
+}
+
+// ---------- the crystal drawing ----------
+
+function qRot(q, v) { return qApply(q, v); }
+
+// Draws the solids of the mineral as a crystal drawing: shaded faces at the
+// front, and dashed lines for the edges at the back.
+function crystal(ctx, P, cx, cy, size) {
+  const solids = cardSolids(P);
+  if (!solids.length) return amorphous(ctx, P, cx, cy, size);
+  // A turn that shows 3 sides of the crystal
+  const view = qMul(qAxisJS([1, 0, 0], .32), qAxisJS([0, 1, 0], -.55));
+  const shapes = solids.map(({ planes, q }) => {
+    const verts = vertices(planes, [1, 1, 1]);
+    const faces = [];
+    planes.forEach(([nx, ny, nz, d]) => {
+      const on = verts.filter(v => Math.abs(nx * v[0] + ny * v[1] + nz * v[2] - d) < 1e-4);
+      if (on.length < 3) return;
+      // Order the corners around the face.
+      const c = on.reduce((a, v) => a.map((x, k) => x + v[k] / on.length), [0, 0, 0]);
+      const n = [nx, ny, nz];
+      const ax = unit(Math.abs(n[0]) < .9 ? [0, n[2], -n[1]] : [n[2], 0, -n[0]]);
+      const ay = [n[1] * ax[2] - n[2] * ax[1], n[2] * ax[0] - n[0] * ax[2], n[0] * ax[1] - n[1] * ax[0]];
+      on.sort((a, b) => {
+        const pa = a.map((v, k) => v - c[k]), pb = b.map((v, k) => v - c[k]);
+        return Math.atan2(pa[0] * ay[0] + pa[1] * ay[1] + pa[2] * ay[2], pa[0] * ax[0] + pa[1] * ax[1] + pa[2] * ax[2]) - Math.atan2(pb[0] * ay[0] + pb[1] * ay[1] + pb[2] * ay[2], pb[0] * ax[0] + pb[1] * ax[1] + pb[2] * ax[2]);
+      });
+      faces.push({ n: qRot(q, n), pts: on.map(v => qRot(q, v)) });
+    });
+    return faces;
+  });
+  // Fit the drawing to the box.
+  const all = shapes.flat().flatMap(f => f.pts.map(p => qRot(view, p)));
+  const xs = all.map(p => p[0]), ys = all.map(p => p[1]);
+  const span = Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys));
+  const k = size / span, mx = (Math.max(...xs) + Math.min(...xs)) / 2, my = (Math.max(...ys) + Math.min(...ys)) / 2;
+  const proj = p => { const v = qRot(view, p); return [cx + (v[0] - mx) * k, cy - (v[1] - my) * k, v[2]]; };
+  const light = unit([-.5, .7, .6]);
+  // The c axis, faint and dashed, through the middle
+  ctx.save();
+  ctx.setLineDash([18, 16]); ctx.strokeStyle = rgba(P.fg, .18); ctx.lineWidth = 3;
+  const a0 = proj([0, -1.9, 0]), a1 = proj([0, 1.9, 0]);
+  ctx.beginPath(); ctx.moveTo(a0[0], a0[1]); ctx.lineTo(a1[0], a1[1]); ctx.stroke();
+  ctx.restore();
+  // Back edges, dashed
+  ctx.save();
+  ctx.setLineDash([14, 12]); ctx.lineWidth = 3; ctx.strokeStyle = rgba(P.fg, .28); ctx.lineJoin = 'round';
+  for (const faces of shapes) for (const f of faces) {
+    if (qRot(view, f.n)[2] > 0) continue;
+    ctx.beginPath(); f.pts.forEach((p, i) => { const q = proj(p); i ? ctx.lineTo(q[0], q[1]) : ctx.moveTo(q[0], q[1]); }); ctx.closePath(); ctx.stroke();
+  }
+  ctx.restore();
+  // Front faces: a tint of the mineral color, lighter where they face the light
+  const front = shapes.flatMap(faces => faces.filter(f => qRot(view, f.n)[2] > 0));
+  front.sort((a, b) => a.pts.reduce((s, p) => s + proj(p)[2], 0) / a.pts.length - b.pts.reduce((s, p) => s + proj(p)[2], 0) / b.pts.length);
+  for (const f of front) {
+    const vn = qRot(view, f.n);
+    const l = Math.max(0, vn[0] * light[0] + vn[1] * light[1] + vn[2] * light[2]);
+    const tone = mix(P.light ? mix(P.bg, P.mineral, .35) : mix(P.bg, P.mineral, .45), P.light ? '#ffffff' : P.fg, l * (P.light ? .55 : .35));
+    ctx.fillStyle = rgba(tone, .92);
+    ctx.beginPath(); f.pts.forEach((p, i) => { const q = proj(p); i ? ctx.lineTo(q[0], q[1]) : ctx.moveTo(q[0], q[1]); }); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = P.fg; ctx.lineWidth = 5; ctx.lineJoin = 'round'; ctx.stroke();
+  }
+}
+
+// Amorphous minerals have no crystal: a broken piece with curved fracture lines.
+function amorphous(ctx, P, cx, cy, size) {
+  const r = rng(P.index * 13);
+  const pts = [];
+  for (let i = 0; i < 9; i++) { const a = i / 9 * Math.PI * 2, rr = size * (.36 + r() * .14); pts.push([cx + Math.cos(a) * rr * 1.2, cy + Math.sin(a) * rr]); }
+  ctx.fillStyle = rgba(mix(P.bg, P.mineral, .5), .9);
+  ctx.beginPath(); pts.forEach((p, i) => i ? ctx.lineTo(...p) : ctx.moveTo(...p)); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = P.fg; ctx.lineWidth = 5; ctx.stroke();
+  ctx.strokeStyle = rgba(P.fg, .35); ctx.lineWidth = 3;
+  for (let i = 1; i <= 4; i++) { ctx.beginPath(); ctx.arc(cx - size * .15, cy - size * .05, size * .09 * i, -.4, 1.9); ctx.stroke(); }
+}
+
+function card(ctx, P, r, noise) {
+  paperBase(ctx, P, noise);
+  const L = 300;
+  let y = titleBlock(ctx, P, L, 380);
+  // The formula, large
+  y += 110;
+  text(ctx, 'FORMULA', L, y, 34, P.c[8], { spacing: 6 });
+  let fs = 120;
+  ctx.save(); ctx.font = `${fs}px ${SERIF}`; const fw = ctx.measureText(P.formula).width; ctx.restore();
+  if (fw > 1700) fs = Math.floor(fs * 1700 / fw);
+  formula(ctx, P, P.formula, L, y + 40 + fs, fs);
+
+  // The crystal drawing on the right, with the system and the habit below it
+  const CX = 2950, CY = 820;
+  crystal(ctx, P, CX, CY, 800);
+  text(ctx, `${P.system.toUpperCase()} SYSTEM`, CX, CY + 540, 40, P.fg, { align: 'center', spacing: 8 });
+  text(ctx, HABIT_WORDS[P.habit] || '', CX, CY + 612, 40, P.dfg, { align: 'center' });
+
+  // The data rows at the bottom
+  const R = 1720;
+  ctx.fillStyle = rgba(P.fg, .12); ctx.fillRect(L, R - 90, W - 2 * L, 3);
+  mohs(ctx, P, L, R, 1180);
+  streak(ctx, P, L + 1460, R, r);
+  cell(ctx, P, L + 2540, R, 'Luster', P.luster, 420);
+  cell(ctx, P, L + 3010, R, 'Density', `${P.sg} g/cm³`, 300);
+  text(ctx, 'LOCALITY', L + 1460, R + 260, 34, P.c[8], { spacing: 6 });
+  text(ctx, P.locality, L + 1460, R + 330, 50, P.fg);
+
+  vignette(ctx, P, P.light ? .12 : .35);
+  grain(ctx, P.index * 29, .04);
+}
+
+// ---------- entry point ----------
+
+window.renderImage = async (theme, width, height, mime = 'image/jpeg', quality = .9) => {
+  await document.fonts.load(`40px ${MONO}`);
+  await document.fonts.load(`300 40px ${SERIF}`);
+  await document.fonts.load(`40px ${SERIF}`);
+  const cv = document.getElementById('c');
+  cv.width = width; cv.height = height;
+  const ctx = cv.getContext('2d');
+  S = width / W;
+  ctx.setTransform(S, 0, 0, S, 0, 0);
+  const c = theme.colors;
+  const day = c.mode === 'light';
+  const mineral = theme.slug === 'alexandrite' && day ? theme.color2 : theme.color;
+  const P = {
+    ...theme, light: day, bg: c.background, fg: c.foreground, dfg: c.dark_foreground, darker: c.darker_background,
+    accent: c.accent, second: theme.second, c: theme.ansi, mineral,
+  };
+  const r = rng(theme.index * 104729 + (P.light ? 3 : 0));
+  const noise = makeNoise(theme.index * 7907 + 3);
+  card(ctx, P, r, noise);
+  return cv.toDataURL(mime, quality);
+};
+</script>
+</body>
+</html>
